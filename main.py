@@ -33,8 +33,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 
-APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
-APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "automation-lab/vinted-scraper").strip()
+VINTED_BASE_URL = os.getenv("VINTED_BASE_URL", "https://www.vinted.pl").strip().rstrip("/")
+VINTED_LOCALE = os.getenv("VINTED_LOCALE", "pl").strip()
+VINTED_CURRENCY = os.getenv("VINTED_CURRENCY", "PLN").strip()
+
+# Alert if direct Vinted API returns empty raw results for all searches this many cycles in a row.
+EMPTY_ALERT_THRESHOLD_CYCLES = int(os.getenv("EMPTY_ALERT_THRESHOLD_CYCLES", "3"))
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
@@ -157,14 +161,27 @@ if not TELEGRAM_BOT_TOKEN:
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 
-if not APIFY_TOKEN:
-    raise RuntimeError("Missing APIFY_TOKEN")
-
 if not GROQ_API_KEY:
     raise RuntimeError("Missing GROQ_API_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+vinted_session = requests.Session()
+vinted_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": f"{VINTED_BASE_URL}/catalog",
+})
+
+EMPTY_ALL_SEARCHES_CYCLES = 0
+LAST_HEALTH_ALERT_TS = 0.0
+HEALTH_ALERT_COOLDOWN_SECONDS = 1800
 
 
 # =========================
@@ -672,56 +689,207 @@ def mark_item_sent(telegram_id: str, search_id: int, item_id: str, url: str) -> 
 
 
 # =========================
-# VINTED / APIFY
+# VINTED DIRECT API
 # =========================
 
-def build_apify_input(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
-    actor_input = {
-        "searchQuery": keyword,
-        "domain": DEFAULT_COUNTRY_DOMAIN,
-        "maxItems": MAX_ITEMS_PER_SEARCH,
+class VintedFetchError(Exception):
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def init_vinted_session() -> None:
+    """
+    Initializes cookies. Vinted often requires a normal page request before API calls.
+    """
+    try:
+        response = vinted_session.get(
+            f"{VINTED_BASE_URL}/catalog",
+            timeout=20,
+            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        )
+        logger.info("Initialized Vinted session: status=%s", response.status_code)
+    except Exception as e:
+        logger.warning("Could not initialize Vinted session: %s", e)
+
+
+def build_vinted_params(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    """
+    Direct Vinted catalog API params.
+    We keep price filtering local because Vinted parameter names can change.
+    """
+    return {
+        "search_text": keyword,
+        "order": "newest_first",
+        "per_page": MAX_ITEMS_PER_SEARCH,
+        "page": 1,
+        "locale": VINTED_LOCALE,
+        "currency": VINTED_CURRENCY,
     }
 
-    if max_price:
-        actor_input["maxPrice"] = max_price
 
-    return actor_input
+def detect_vinted_block(response: requests.Response) -> Optional[str]:
+    text = (response.text or "")[:2000].lower()
+
+    if response.status_code in [401, 403, 429]:
+        return f"HTTP {response.status_code}"
+
+    if "captcha" in text or "cf-challenge" in text or "cloudflare" in text:
+        return "captcha/cloudflare detected"
+
+    if "access denied" in text or "forbidden" in text:
+        return "access denied"
+
+    return None
+
+
+def direct_vinted_request(keyword: str, max_price: Optional[float]) -> List[Dict[str, Any]]:
+    endpoint = f"{VINTED_BASE_URL}/api/v2/catalog/items"
+    params = build_vinted_params(keyword, max_price)
+
+    logger.info("Direct Vinted request: %s params=%s", endpoint, params)
+
+    response = vinted_session.get(endpoint, params=params, timeout=30)
+
+    block_reason = detect_vinted_block(response)
+    if block_reason:
+        # Try once with refreshed cookies.
+        logger.warning("Vinted blocked or rate-limited request: %s. Refreshing session and retrying once.", block_reason)
+        init_vinted_session()
+        response = vinted_session.get(endpoint, params=params, timeout=30)
+        block_reason = detect_vinted_block(response)
+        if block_reason:
+            raise VintedFetchError(
+                "blocked",
+                f"Vinted direct API blocked request ({block_reason}). Status={response.status_code}"
+            )
+
+    if response.status_code >= 500:
+        raise VintedFetchError(
+            "server_error",
+            f"Vinted server error {response.status_code}: {response.text[:300]}"
+        )
+
+    if response.status_code >= 400:
+        raise VintedFetchError(
+            "http_error",
+            f"Vinted HTTP error {response.status_code}: {response.text[:300]}"
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        raise VintedFetchError(
+            "bad_json",
+            f"Vinted returned non-JSON response. First chars: {response.text[:300]}"
+        )
+
+    if isinstance(data, dict):
+        items = data.get("items")
+        if isinstance(items, list):
+            return items
+
+        # Sometimes APIs wrap differently. Treat this as format break.
+        keys = ", ".join(list(data.keys())[:15])
+        raise VintedFetchError(
+            "api_changed",
+            f"Vinted API format changed or unexpected. JSON keys: {keys}"
+        )
+
+    if isinstance(data, list):
+        return data
+
+    raise VintedFetchError(
+        "api_changed",
+        f"Vinted API returned unexpected type: {type(data).__name__}"
+    )
+
+
+def normalize_vinted_direct_item(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize Vinted direct API item to our existing format.
+    """
+    item_id = get_first_existing(raw, ["id", "item_id"], "")
+    title = get_first_existing(raw, ["title", "name"], "No title")
+
+    url = get_first_existing(raw, ["url"], "")
+    if url and isinstance(url, str) and url.startswith("/"):
+        url = f"{VINTED_BASE_URL}{url}"
+    if not url and item_id:
+        # Fallback URL, not always perfect but usually usable.
+        slug = re.sub(r"[^a-z0-9]+", "-", str(title).lower()).strip("-")
+        url = f"{VINTED_BASE_URL}/items/{item_id}-{slug}"
+
+    price_raw = get_first_existing(raw, ["price", "price_amount", "total_item_price"], None)
+    price = normalize_price(price_raw)
+
+    currency = VINTED_CURRENCY
+    if isinstance(price_raw, dict):
+        currency = str(get_first_existing(price_raw, ["currency_code", "currency"], VINTED_CURRENCY))
+
+    brand = get_first_existing(raw, ["brand_title", "brand", "brand_name"], "")
+    if isinstance(brand, dict):
+        brand = get_first_existing(brand, ["title", "name"], "")
+
+    size = get_first_existing(raw, ["size_title", "size"], "")
+    status = get_first_existing(raw, ["status", "condition", "status_title"], "")
+
+    description = get_first_existing(raw, ["description", "desc"], "")
+    seller = get_first_existing(raw, ["user", "seller"], "")
+    if isinstance(seller, dict):
+        seller = get_first_existing(seller, ["login", "username", "name"], "")
+
+    location = get_first_existing(raw, ["city", "location", "country"], "")
+
+    photo = get_first_existing(raw, ["photo"], "")
+    image = ""
+    if isinstance(photo, dict):
+        image = get_first_existing(photo, ["url", "full_size_url", "thumb_url"], "")
+    else:
+        image = get_first_existing(raw, ["image", "imageUrl", "thumbnail"], "")
+
+    photos = get_first_existing(raw, ["photos"], [])
+    images = []
+    if isinstance(photos, list):
+        for p in photos:
+            if isinstance(p, dict):
+                u = get_first_existing(p, ["url", "full_size_url", "thumb_url"], "")
+                if u:
+                    images.append(u)
+
+    age_minutes, age_source = get_item_age_minutes(raw)
+
+    return {
+        "id": str(item_id or url),
+        "title": str(title),
+        "url": str(url),
+        "price": price,
+        "currency": str(currency),
+        "brand": str(brand),
+        "size": str(size),
+        "condition": str(status),
+        "description": str(description),
+        "seller": str(seller),
+        "location": str(location),
+        "image": str(image),
+        "images": images,
+        "age_minutes": age_minutes,
+        "age_source": age_source,
+        "raw": raw,
+    }
 
 
 def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[str, Any]]:
-    actor_id_for_url = APIFY_ACTOR_ID.replace("/", "~")
-    url = (
-        f"https://api.apify.com/v2/acts/"
-        f"{actor_id_for_url}/run-sync-get-dataset-items"
-        f"?token={APIFY_TOKEN}"
-    )
-
-    payload = build_apify_input(keyword, max_price)
-
-    logger.info("Running Apify actor %s with input: %s", APIFY_ACTOR_ID, payload)
-
-    response = requests.post(
-        url,
-        json=payload,
-        timeout=120,
-        headers={"Content-Type": "application/json"},
-    )
-
-    if response.status_code >= 400:
-        logger.error("Apify error %s: %s", response.status_code, response.text[:1000])
-        raise RuntimeError(f"Apify error {response.status_code}: {response.text[:500]}")
-
-    data = response.json()
-
-    if not isinstance(data, list):
-        logger.warning("Unexpected Apify response: %s", str(data)[:1000])
-        return []
+    raw_items = direct_vinted_request(keyword, max_price)
 
     filtered_recent = []
     skipped_old = 0
     skipped_unknown = 0
+    skipped_quality = 0
+    skipped_product = 0
 
-    for raw_item in data:
+    for raw_item in raw_items:
         if not isinstance(raw_item, dict):
             continue
 
@@ -737,22 +905,24 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
 
         quality_ok, quality_reason = passes_quality_filter(raw_item)
         if not quality_ok:
+            skipped_quality += 1
             logger.info("Skipped item by quality: %s", quality_reason)
             continue
 
         product_ok, product_reason = passes_product_profile_filter(raw_item, keyword)
         if not product_ok:
+            skipped_product += 1
             logger.info("Skipped item by product profile: %s", product_reason)
             continue
 
         filtered_recent.append(raw_item)
 
     logger.info(
-        "Freshness filter: input=%s kept=%s skipped_old=%s skipped_unknown=%s only_recent=%smin skip_unknown=%s",
-        len(data), len(filtered_recent), skipped_old, skipped_unknown, ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE
+        "Direct Vinted filter: input=%s kept=%s skipped_old=%s skipped_unknown=%s skipped_quality=%s skipped_product=%s",
+        len(raw_items), len(filtered_recent), skipped_old, skipped_unknown, skipped_quality, skipped_product
     )
 
-    normalized = [normalize_item(item) for item in filtered_recent if isinstance(item, dict)]
+    normalized = [normalize_vinted_direct_item(item) for item in filtered_recent if isinstance(item, dict)]
 
     if max_price:
         normalized = [
@@ -761,7 +931,6 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
         ]
 
     return normalized
-
 
 # =========================
 # AI EVALUATION - GROQ
@@ -984,6 +1153,18 @@ async def process_search(
             sent_count += 1
             time.sleep(0.5)
 
+    except VintedFetchError as e:
+        logger.error("Vinted fetch error: %s %s", e.kind, e.message)
+        logger.error(traceback.format_exc())
+
+        if manual:
+            await application.bot.send_message(
+                chat_id=telegram_id,
+                text=f"⚠️ Проблема з Vinted direct при пошуку '{keyword}': {e.kind}\n{e.message}",
+            )
+        else:
+            raise
+
     except Exception as e:
         logger.error("Search processing error: %s", e)
         logger.error(traceback.format_exc())
@@ -993,11 +1174,48 @@ async def process_search(
                 chat_id=telegram_id,
                 text=f"Помилка при перевірці пошуку '{keyword}': {e}",
             )
+        else:
+            raise
 
     return sent_count
 
 
+async def send_health_alert(application: Application, telegram_id: str, title: str, details: str) -> None:
+    """
+    Notify user when direct Vinted access probably broke.
+    Cooldown prevents spam.
+    """
+    global LAST_HEALTH_ALERT_TS
+
+    now = time.time()
+    if now - LAST_HEALTH_ALERT_TS < HEALTH_ALERT_COOLDOWN_SECONDS:
+        return
+
+    LAST_HEALTH_ALERT_TS = now
+
+    text = f"""
+⚠️ <b>Vinted bot health alert</b>
+
+<b>{escape(title)}</b>
+
+{escape(details)}
+
+Ймовірно, треба втрутитись: Vinted міг дати 403/captcha, змінити API або повертати порожні результати.
+"""
+
+    try:
+        await application.bot.send_message(
+            chat_id=telegram_id,
+            text=text.strip(),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error("Failed to send health alert: %s", e)
+
+
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global EMPTY_ALL_SEARCHES_CYCLES
+
     application = context.application
     searches = get_active_searches()
 
@@ -1008,10 +1226,53 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Scheduled check started. Searches: %s", len(searches))
 
     total_sent = 0
+    had_vinted_error = False
+    all_searches_empty_or_failed = True
+
+    # Use first user's telegram_id as alert recipient.
+    alert_telegram_id = str(searches[0]["telegram_id"])
 
     for search in searches:
-        sent = await process_search(application, search, manual=False)
-        total_sent += sent
+        try:
+            sent = await process_search(application, search, manual=False)
+            total_sent += sent
+
+            # If no exception, at least direct call worked.
+            # Empty detection is approximate; /debug can confirm.
+            all_searches_empty_or_failed = False
+
+        except VintedFetchError as e:
+            had_vinted_error = True
+            logger.error("Vinted health error during scheduled check: %s %s", e.kind, e.message)
+            await send_health_alert(
+                application,
+                alert_telegram_id,
+                f"Vinted direct error: {e.kind}",
+                e.message,
+            )
+        except Exception as e:
+            had_vinted_error = True
+            logger.error("Unexpected scheduled check error: %s", e)
+            logger.error(traceback.format_exc())
+            await send_health_alert(
+                application,
+                alert_telegram_id,
+                "Unexpected bot error",
+                str(e),
+            )
+
+    if all_searches_empty_or_failed and not had_vinted_error:
+        EMPTY_ALL_SEARCHES_CYCLES += 1
+    else:
+        EMPTY_ALL_SEARCHES_CYCLES = 0
+
+    if EMPTY_ALL_SEARCHES_CYCLES >= EMPTY_ALERT_THRESHOLD_CYCLES:
+        await send_health_alert(
+            application,
+            alert_telegram_id,
+            "Vinted повертає порожні результати",
+            f"Уже {EMPTY_ALL_SEARCHES_CYCLES} циклів підряд усі пошуки виглядають порожніми. Можливо, Vinted змінив API або блокує запити.",
+        )
 
     logger.info("Scheduled check finished. Sent: %s", total_sent)
 
@@ -1033,7 +1294,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = f"""
 👋 Привіт! Я <b>Vinted AI Deal Hunter</b>.
 
-Я шукаю свіжі оферти на Vinted і оцінюю їх через Groq AI.
+Я шукаю свіжі оферти напряму на Vinted без Apify і оцінюю їх через Groq AI.
 
 <b>Зараз фільтр:</b>
 тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>\nІ відкидаю аксесуари: <b>etui, folia, szkło, ładowarka, pasek</b>\nФільтр спрощений: перевіряю назву + опис + бренд, а фінальну оцінку дає AI.
@@ -1071,7 +1332,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 4. Перевірити вручну:
 <code>/check</code>
 
-5. Тест Apify:
+5. Тест Vinted direct:
 <code>/debug ipad</code>
 
 <b>Фільтр свіжості:</b>
@@ -1206,35 +1467,17 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     keyword = " ".join(context.args).strip() or "ipad"
 
-    await message.reply_text(f"Тестую Apify по запиту: {keyword}")
+    await message.reply_text(f"Тестую Vinted direct по запиту: {keyword}")
 
     try:
-        actor_id_for_url = APIFY_ACTOR_ID.replace("/", "~")
-        url = (
-            f"https://api.apify.com/v2/acts/"
-            f"{actor_id_for_url}/run-sync-get-dataset-items"
-            f"?token={APIFY_TOKEN}"
-        )
-        payload = build_apify_input(keyword, None)
+        raw_items = direct_vinted_request(keyword, None)
 
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=120,
-            headers={"Content-Type": "application/json"},
-        )
-
-        if response.status_code >= 400:
-            await message.reply_text(f"Debug error: Apify error {response.status_code}: {response.text[:800]}")
+        if not raw_items:
+            await message.reply_text("Vinted direct повернув 0 raw items.")
             return
 
-        data = response.json()
-        if not isinstance(data, list) or not data:
-            await message.reply_text("Apify повернув 0 items.")
-            return
-
-        first_raw = data[0]
-        first = normalize_item(first_raw)
+        first_raw = raw_items[0]
+        first = normalize_vinted_direct_item(first_raw)
         ok, reason = is_recent_item(first_raw)
         quality_ok, quality_reason = passes_quality_filter(first_raw)
         product_ok, product_reason = passes_product_profile_filter(first_raw, keyword)
@@ -1258,6 +1501,11 @@ product_reason: {escape(product_reason)}
 
         await message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
 
+    except VintedFetchError as e:
+        await message.reply_text(
+            f"⚠️ Vinted direct problem: {escape(e.kind)}\\n{escape(e.message)}",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as e:
         await message.reply_text(f"Debug error: {e}")
 
@@ -1284,7 +1532,7 @@ def main() -> None:
         name="scheduled_vinted_check",
     )
 
-    logger.info("Bot started. Freshness filter: ONLY_RECENT_MINUTES=%s SKIP_UNKNOWN_AGE=%s", ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
+    init_vinted_session()\n    logger.info("Bot started in DIRECT VINTED mode. Freshness filter: ONLY_RECENT_MINUTES=%s SKIP_UNKNOWN_AGE=%s", ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
