@@ -290,10 +290,19 @@ def mark_item_sent(telegram_id: str, search_id: int, item_id: str, url: str) -> 
 def build_apify_input(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
     """
     Input for piotrv1001/vinted-listings-scraper.
+    We force Polish Vinted by passing vinted.pl search URL.
     Price is filtered locally after Apify returns items.
     """
+    from urllib.parse import quote_plus
+
+    search_url = f"https://www.vinted.pl/catalog?search_text={quote_plus(keyword)}"
+
     return {
-        "searchQueries": [keyword],
+        "startUrls": [
+            {
+                "url": search_url
+            }
+        ],
         "maxItems": MAX_ITEMS_PER_SEARCH,
         "proxyConfiguration": {
             "useApifyProxy": True,
