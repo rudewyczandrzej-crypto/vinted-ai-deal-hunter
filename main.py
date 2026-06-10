@@ -83,6 +83,65 @@ BAD_KEYWORDS = [
     if x.strip()
 ]
 
+# Category/product filter.
+# This lets you keep broad searches like:
+# /add ipad до 1100
+# /add apple watch se до 500
+# /add redmi pad pro до 850
+# and reject accessories like etui/folia/szkło/ładowarka/pasek.
+REJECT_ACCESSORIES = os.getenv("REJECT_ACCESSORIES", "true").lower() in ["1", "true", "yes", "y"]
+
+ACCESSORY_KEYWORDS = [
+    x.strip().lower()
+    for x in os.getenv(
+        "ACCESSORY_KEYWORDS",
+        "etui,case,cover,pokrowiec,obudowa,"
+        "szkło,szklo,szkiełko,szkielko,folia,ochronna,ochronne,"
+        "kabel,przewód,przewod,ładowarka,ladowarka,charger,zasilacz,"
+        "pasek,strap,bransoleta,bransoletka,band,"
+        "rysik,stylus,apple pencil,pencil,"
+        "klawiatura,keyboard,"
+        "pudełko,pudelko,box,samo pudełko,samo pudelko,"
+        "uchwyt,stojak,holder"
+    ).split(",")
+    if x.strip()
+]
+
+# Allowlist model filter.
+# Instead of blocking every old model, the bot allows only the models/phrases we care about.
+ENABLE_MODEL_ALLOWLIST = os.getenv("ENABLE_MODEL_ALLOWLIST", "true").lower() in ["1", "true", "yes", "y"]
+
+IPAD_ALLOWED_KEYWORDS = [
+    x.strip().lower()
+    for x in os.getenv(
+        "IPAD_ALLOWED_KEYWORDS",
+        "ipad 9,ipad 9 gen,ipad 9 generacji,ipad 9th,ipad 2021,"
+        "ipad 10,ipad 10 gen,ipad 10 generacji,ipad 10th,ipad 2022,"
+        "ipad a16,ipad 11,ipad 11 gen,ipad 11 generacji,ipad 2025,ipad 10.9,ipad 10,9"
+    ).split(",")
+    if x.strip()
+]
+
+APPLE_WATCH_SE_ALLOWED_KEYWORDS = [
+    x.strip().lower()
+    for x in os.getenv(
+        "APPLE_WATCH_SE_ALLOWED_KEYWORDS",
+        "apple watch se,watch se,se 2,se 2 generacji,se 2gen,se 2 gen,"
+        "se 2nd,se second,se 2022,se 2023,apple watch se 2,apple watch se2"
+    ).split(",")
+    if x.strip()
+]
+
+REDMI_PAD_PRO_ALLOWED_KEYWORDS = [
+    x.strip().lower()
+    for x in os.getenv(
+        "REDMI_PAD_PRO_ALLOWED_KEYWORDS",
+        "redmi pad pro,xiaomi redmi pad pro,pad pro 12.1,pad pro 12,1,"
+        "redmi pad pro 6/128,redmi pad pro 8/256,redmi pad pro 8gb,redmi pad pro 6gb"
+    ).split(",")
+    if x.strip()
+]
+
 DEFAULT_COUNTRY_DOMAIN = "vinted.pl"
 
 logging.basicConfig(
@@ -369,6 +428,94 @@ def passes_quality_filter(raw: Dict[str, Any]) -> Tuple[bool, str]:
     return True, "quality ok"
 
 
+def detect_search_profile(search_keyword: str) -> str:
+    """
+    Map user's broad search into product profile.
+    """
+    k = (search_keyword or "").lower()
+
+    if "apple watch" in k or "watch se" in k:
+        return "apple_watch_se"
+
+    if "redmi" in k and "pad" in k:
+        return "redmi_pad_pro"
+
+    if "ipad" in k:
+        return "ipad"
+
+    return "generic"
+
+
+def has_any(text: str, words: List[str]) -> bool:
+    return any(word in text for word in words if word)
+
+
+def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> Tuple[bool, str]:
+    """
+    Reject accessories and mismatched products after a broad Vinted search.
+    Uses allowlist for target models, so broad searches stay cheap:
+    /add ipad до 1100
+    /add apple watch se до 500
+    /add redmi pad pro до 850
+    """
+    if not REJECT_ACCESSORIES:
+        return True, "product filter disabled"
+
+    text = item_searchable_text(raw)
+    profile = detect_search_profile(search_keyword)
+
+    # Universal accessory rejection for our target electronics searches.
+    if profile in ["ipad", "apple_watch_se", "redmi_pad_pro"]:
+        for keyword in ACCESSORY_KEYWORDS:
+            if keyword and keyword in text:
+                return False, f"accessory keyword: {keyword}"
+
+    if profile == "ipad":
+        if "ipad" not in text:
+            return False, "missing ipad keyword"
+
+        if has_any(text, ["iphone", "macbook", "airpods", "apple watch"]):
+            return False, "wrong Apple product"
+
+        if ENABLE_MODEL_ALLOWLIST:
+            if not has_any(text, IPAD_ALLOWED_KEYWORDS):
+                return False, "ipad not in allowed model list"
+
+        return True, "ipad allowed model ok"
+
+    if profile == "apple_watch_se":
+        if not ("apple" in text and "watch" in text):
+            return False, "missing apple watch keywords"
+
+        if ENABLE_MODEL_ALLOWLIST:
+            if not has_any(text, APPLE_WATCH_SE_ALLOWED_KEYWORDS):
+                return False, "apple watch not in SE allowlist"
+
+        # Extra protection: if listing clearly says a non-SE series, reject it.
+        if has_any(text, [
+            "series 1", "series 2", "series 3", "series 4", "series 5",
+            "series 6", "series 7", "series 8", "series 9", "series 10",
+            "ultra"
+        ]):
+            return False, "wrong apple watch series"
+
+        return True, "apple watch se allowed model ok"
+
+    if profile == "redmi_pad_pro":
+        if not ("redmi" in text and "pad" in text and "pro" in text):
+            return False, "missing redmi pad pro keywords"
+
+        if has_any(text, ["redmi note", "xiaomi note", "telefon", "smartfon", "phone"]):
+            return False, "wrong redmi product"
+
+        if ENABLE_MODEL_ALLOWLIST:
+            if not has_any(text, REDMI_PAD_PRO_ALLOWED_KEYWORDS):
+                return False, "redmi pad pro not in allowed model list"
+
+        return True, "redmi pad pro allowed model ok"
+
+    return True, "generic profile ok"
+
 def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     title = get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "No title")
     url = get_first_existing(raw, ["url", "itemUrl", "link", "productUrl", "item_url"], "")
@@ -565,6 +712,11 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
         quality_ok, quality_reason = passes_quality_filter(raw_item)
         if not quality_ok:
             logger.info("Skipped item by quality: %s", quality_reason)
+            continue
+
+        product_ok, product_reason = passes_product_profile_filter(raw_item, keyword)
+        if not product_ok:
+            logger.info("Skipped item by product profile: %s", product_reason)
             continue
 
         filtered_recent.append(raw_item)
@@ -858,7 +1010,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 Я шукаю свіжі оферти на Vinted і оцінюю їх через Groq AI.
 
 <b>Зараз фільтр:</b>
-тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>
+тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>\nІ відкидаю аксесуари: <b>etui, folia, szkło, ładowarka, pasek</b>\nТакож пропускаю тільки потрібні моделі через <b>allowlist</b>.
 
 <b>Команди:</b>
 
@@ -1059,6 +1211,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         first = normalize_item(first_raw)
         ok, reason = is_recent_item(first_raw)
         quality_ok, quality_reason = passes_quality_filter(first_raw)
+        product_ok, product_reason = passes_product_profile_filter(first_raw, keyword)
 
         text = f"""
 <b>Перший item:</b>
@@ -1073,6 +1226,8 @@ recent_filter: {escape(ok)}
 recent_reason: {escape(reason)}
 quality_filter: {escape(quality_ok)}
 quality_reason: {escape(quality_reason)}
+product_filter: {escape(product_ok)}
+product_reason: {escape(product_reason)}
 """
 
         await message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
