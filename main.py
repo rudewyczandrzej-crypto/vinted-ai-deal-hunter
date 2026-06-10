@@ -513,7 +513,7 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
     """
     Product filter:
     - uses title + description + brand + raw Vinted text
-    - iPad is strict again: only 9/10 gen, 2021/2022, A16, 10.9/10,9
+    - iPad uses strict regex model matching
     - Apple Watch search is specifically for SE 2, not SE 1
     - Redmi Pad Pro stays strict: Redmi + Pad + Pro
     """
@@ -536,6 +536,9 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
                 return keyword
         return None
 
+    def regex_any(patterns: List[str], value: str) -> bool:
+        return any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in patterns)
+
     if profile == "ipad":
         if "ipad" not in combined:
             return False, "missing ipad keyword in title/description"
@@ -543,24 +546,35 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         if has_any(combined, ["iphone", "macbook", "airpods", "apple watch"]):
             return False, "wrong Apple product"
 
-        # Strict iPad allowlist.
-        # We do NOT want iPad 7 / 8 / older.
-        ipad_allowed = [
-            "ipad 9", "ipad 9gen", "ipad 9 gen", "ipad 9 generacji",
-            "ipad 9. generacji", "ipad 9th", "9th gen", "9 gen", "9gen",
-            "ipad 2021",
-
-            "ipad 10", "ipad 10gen", "ipad 10 gen", "ipad 10 generacji",
-            "ipad 10. generacji", "ipad 10th", "10th gen", "10 gen", "10gen",
-            "ipad 2022",
-
-            "ipad a16", "a16",
-            "ipad 10.9", "ipad 10,9", "10.9", "10,9",
-            "ipad 11", "ipad 2025"
+        # First reject old iPads explicitly.
+        # Examples: iPad 7th gen, iPad 8gen, iPad 8 gen, iPad 8 generacji.
+        ipad_rejected_patterns = [
+            r"\bipad\s*(?:1|2|3|4|5|6|7|8)\s*(?:gen|generacji|\.?\s*generacji|th)?\b",
+            r"\bipad\s*(?:1st|2nd|3rd|4th|5th|6th|7th|8th)\s*(?:gen|generation)?\b",
+            r"\b(?:1st|2nd|3rd|4th|5th|6th|7th|8th)\s*gen\b",
+            r"\bipad\s*air\s*(?:1|2)?\b",
+            r"\bipad\s*mini\s*(?:1|2|3|4|5)?\b",
         ]
 
-        if not has_any(combined, ipad_allowed):
-            return False, "ipad is not in allowed model list"
+        if regex_any(ipad_rejected_patterns, combined):
+            return False, "old ipad generation rejected"
+
+        # Then allow only wanted iPads.
+        # Important: do NOT allow plain "10.2", because iPad 7/8 also has 10.2".
+        ipad_allowed_patterns = [
+            r"\bipad\s*9\s*(?:gen|generacji|\.?\s*generacji|th)\b",
+            r"\bipad\s*10\s*(?:gen|generacji|\.?\s*generacji|th)\b",
+            r"\bipad\s*(?:9th|10th)\s*(?:gen|generation)?\b",
+            r"\bipad\b.*\b(?:9th|10th)\s*gen\b",
+            r"\bipad\b.*\b(?:2021|2022|a16)\b",
+            r"\bipad\s*(?:2021|2022|a16)\b",
+            r"\bipad\b.*\b10[\.,]9\b",
+            r"\bipad\s*11\b",
+            r"\bipad\b.*\b2025\b",
+        ]
+
+        if not regex_any(ipad_allowed_patterns, combined):
+            return False, "ipad is not in allowed regex model list"
 
         accessory = title_has_accessory()
         if accessory:
@@ -571,15 +585,13 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
             if not has_any(combined, device_hints):
                 return False, f"likely ipad accessory only: {accessory}"
 
-        return True, "ipad allowed model filter ok"
+        return True, "ipad regex model filter ok"
 
     if profile == "apple_watch_se":
         # We are looking specifically for Apple Watch SE 2.
-        # Sellers may write SE 2 only in description, so check combined text.
         if not ("apple" in combined and "watch" in combined):
             return False, "missing apple watch keywords in title/description"
 
-        # Reject obvious other lines.
         if has_any(combined, [
             "series 1", "series 2", "series 3", "series 4", "series 5",
             "series 6", "series 7", "series 8", "series 9", "series 10",
@@ -587,7 +599,6 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         ]):
             return False, "wrong apple watch series"
 
-        # SE 2 allowlist. Plain "Apple Watch SE 40mm" is probably SE 1, so reject it.
         se2_hints = [
             "se 2", "se2", "se 2gen", "se 2 gen", "se gen 2",
             "se 2 generacji", "se 2. generacji",
@@ -611,7 +622,6 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         return True, "apple watch se 2 filter ok"
 
     if profile == "redmi_pad_pro":
-        # Keep Redmi strict: must be Redmi + Pad + Pro.
         if not ("redmi" in combined and "pad" in combined):
             return False, "missing redmi pad keywords in title/description"
 
