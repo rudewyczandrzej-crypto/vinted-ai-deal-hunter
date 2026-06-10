@@ -289,26 +289,18 @@ def mark_item_sent(telegram_id: str, search_id: int, item_id: str, url: str) -> 
 
 def build_apify_input(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
     """
-    Input for deltaspider/vinted-scraper.
-    It uses direct Vinted search URLs, so we force Polish Vinted.
-    Price is still filtered locally after Apify returns items.
+    Input for automation-lab/vinted-scraper.
     """
-    from urllib.parse import quote_plus
-
-    search_url = f"https://www.vinted.pl/catalog?search_text={quote_plus(keyword)}&order=newest_first"
-
-    return {
-        "startUrls": [
-            {
-                "url": search_url
-            }
-        ],
-        "maxResultsPerUrl": MAX_ITEMS_PER_SEARCH,
-        "maxRetries": 2,
-        "proxyConfiguration": {
-            "useApifyProxy": True
-        }
+    actor_input = {
+        "query": keyword,
+        "domain": DEFAULT_COUNTRY_DOMAIN,
+        "maxItems": MAX_ITEMS_PER_SEARCH,
     }
+
+    if max_price:
+        actor_input["maxPrice"] = max_price
+
+    return actor_input
 
 
 def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[str, Any]]:
