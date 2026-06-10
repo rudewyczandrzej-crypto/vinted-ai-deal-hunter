@@ -51,6 +51,38 @@ ONLY_RECENT_MINUTES = int(os.getenv("ONLY_RECENT_MINUTES", "5"))
 # false = allow item, may send old listings
 SKIP_UNKNOWN_AGE = os.getenv("SKIP_UNKNOWN_AGE", "true").lower() in ["1", "true", "yes", "y"]
 
+# Quality filter for electronics.
+# This rejects risky Vinted listings before Groq AI evaluation, so it costs less.
+REJECT_BAD_CONDITIONS = os.getenv("REJECT_BAD_CONDITIONS", "true").lower() in ["1", "true", "yes", "y"]
+
+BAD_CONDITIONS = [
+    x.strip().lower()
+    for x in os.getenv("BAD_CONDITIONS", "zadowalający,zadowalajacy").split(",")
+    if x.strip()
+]
+
+BAD_KEYWORDS = [
+    x.strip().lower()
+    for x in os.getenv(
+        "BAD_KEYWORDS",
+        "uszkodzony,uszkodzona,uszkodzone,"
+        "pęknięty,pekniety,pęknięta,peknieta,pęknięcie,pekniecie,"
+        "zbity ekran,zbita szybka,zbita,pęknięta szybka,peknieta szybka,"
+        "porysowany ekran,rysy na ekranie,"
+        "nie działa,nie dziala,niedziała,niedziala,"
+        "części,czesci,na części,na czesci,"
+        "blokada,icloud,apple id,appleid,"
+        "zablokowany,zablokowana,zablokowane,"
+        "zablokowany apple id,zablokowane apple id,blokada apple id,"
+        "blokada icloud,icloud lock,activation lock,"
+        "brak hasła,brak hasla,nie znam hasła,nie znam hasla,"
+        "wylogowany nie jest,nie wylogowany,nie wylogowana,"
+        "locked,account locked,apple id locked,"
+        "cracked,broken,damaged,for parts,not working"
+    ).split(",")
+    if x.strip()
+]
+
 DEFAULT_COUNTRY_DOMAIN = "vinted.pl"
 
 logging.basicConfig(
@@ -304,6 +336,39 @@ def is_recent_item(raw: Dict[str, Any]) -> Tuple[bool, str]:
     return False, f"{age_minutes} min old, older than {ONLY_RECENT_MINUTES} min ({source})"
 
 
+def item_searchable_text(raw: Dict[str, Any]) -> str:
+    """
+    Build text from title/description/condition and raw small text fragments.
+    Used to catch risky words like locked Apple ID / iCloud / damaged.
+    """
+    title = str(get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], ""))
+    description = str(get_first_existing(raw, ["description", "desc"], ""))
+    condition = str(get_first_existing(raw, ["condition", "status"], ""))
+    brand = str(get_first_existing(raw, ["brand", "brandTitle", "brand_name"], ""))
+    flat = flatten_text_values(raw)
+    return f"{title} | {description} | {condition} | {brand} | {flat}".lower()
+
+
+def passes_quality_filter(raw: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Reject obviously bad electronics before spending Groq tokens.
+    """
+    if not REJECT_BAD_CONDITIONS:
+        return True, "quality filter disabled"
+
+    text = item_searchable_text(raw)
+
+    condition = str(get_first_existing(raw, ["condition", "status"], "")).strip().lower()
+    if condition and any(bad == condition or bad in condition for bad in BAD_CONDITIONS):
+        return False, f"bad condition: {condition}"
+
+    for keyword in BAD_KEYWORDS:
+        if keyword and keyword in text:
+            return False, f"bad keyword: {keyword}"
+
+    return True, "quality ok"
+
+
 def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     title = get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "No title")
     url = get_first_existing(raw, ["url", "itemUrl", "link", "productUrl", "item_url"], "")
@@ -495,6 +560,11 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
             else:
                 skipped_old += 1
             logger.info("Skipped item by age: %s", reason)
+            continue
+
+        quality_ok, quality_reason = passes_quality_filter(raw_item)
+        if not quality_ok:
+            logger.info("Skipped item by quality: %s", quality_reason)
             continue
 
         filtered_recent.append(raw_item)
@@ -788,7 +858,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 Я шукаю свіжі оферти на Vinted і оцінюю їх через Groq AI.
 
 <b>Зараз фільтр:</b>
-тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>
+тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>
 
 <b>Команди:</b>
 
@@ -988,6 +1058,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         first_raw = data[0]
         first = normalize_item(first_raw)
         ok, reason = is_recent_item(first_raw)
+        quality_ok, quality_reason = passes_quality_filter(first_raw)
 
         text = f"""
 <b>Перший item:</b>
@@ -999,7 +1070,9 @@ brand: {escape(first.get("brand"))}
 condition: {escape(first.get("condition"))}
 age_minutes: {escape(first.get("age_minutes"))}
 recent_filter: {escape(ok)}
-reason: {escape(reason)}
+recent_reason: {escape(reason)}
+quality_filter: {escape(quality_ok)}
+quality_reason: {escape(quality_reason)}
 """
 
         await message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
