@@ -511,11 +511,11 @@ def has_any(text: str, words: List[str]) -> bool:
 
 def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> Tuple[bool, str]:
     """
-    Simpler product filter:
-    - uses title + description + brand + raw text from Vinted
-    - avoids overly strict filters for iPad/Redmi
-    - but Apple Watch search is specifically for SE 2, not SE 1
-    - lets Groq AI make the final judgement after basic matching
+    Product filter:
+    - uses title + description + brand + raw Vinted text
+    - iPad is strict again: only 9/10 gen, 2021/2022, A16, 10.9/10,9
+    - Apple Watch search is specifically for SE 2, not SE 1
+    - Redmi Pad Pro stays strict: Redmi + Pad + Pro
     """
     if not REJECT_ACCESSORIES:
         return True, "product filter disabled"
@@ -543,16 +543,35 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         if has_any(combined, ["iphone", "macbook", "airpods", "apple watch"]):
             return False, "wrong Apple product"
 
+        # Strict iPad allowlist.
+        # We do NOT want iPad 7 / 8 / older.
+        ipad_allowed = [
+            "ipad 9", "ipad 9gen", "ipad 9 gen", "ipad 9 generacji",
+            "ipad 9. generacji", "ipad 9th", "9th gen", "9 gen", "9gen",
+            "ipad 2021",
+
+            "ipad 10", "ipad 10gen", "ipad 10 gen", "ipad 10 generacji",
+            "ipad 10. generacji", "ipad 10th", "10th gen", "10 gen", "10gen",
+            "ipad 2022",
+
+            "ipad a16", "a16",
+            "ipad 10.9", "ipad 10,9", "10.9", "10,9",
+            "ipad 11", "ipad 2025"
+        ]
+
+        if not has_any(combined, ipad_allowed):
+            return False, "ipad is not in allowed model list"
+
         accessory = title_has_accessory()
         if accessory:
             device_hints = [
                 "gb", "wifi", "wi-fi", "cellular", "tablet", "generacji",
-                "gen", "a16", "2021", "2022", "10.9", "10,9"
+                "gen", "a16", "2021", "2022", "10.9", "10,9", "32gb", "64gb", "128gb", "256gb"
             ]
             if not has_any(combined, device_hints):
                 return False, f"likely ipad accessory only: {accessory}"
 
-        return True, "ipad broad filter ok"
+        return True, "ipad allowed model filter ok"
 
     if profile == "apple_watch_se":
         # We are looking specifically for Apple Watch SE 2.
@@ -568,8 +587,7 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         ]):
             return False, "wrong apple watch series"
 
-        # SE 2 allowlist. This is intentionally stricter than before.
-        # Plain "Apple Watch SE 40mm" is probably SE 1, so reject it.
+        # SE 2 allowlist. Plain "Apple Watch SE 40mm" is probably SE 1, so reject it.
         se2_hints = [
             "se 2", "se2", "se 2gen", "se 2 gen", "se gen 2",
             "se 2 generacji", "se 2. generacji",
