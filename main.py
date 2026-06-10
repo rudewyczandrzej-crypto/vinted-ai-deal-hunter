@@ -512,10 +512,10 @@ def has_any(text: str, words: List[str]) -> bool:
 def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> Tuple[bool, str]:
     """
     Simpler product filter:
-    - uses title + description + brand + raw text from Apify
-    - avoids very strict allowlists that can miss good listings
-    - rejects obvious wrong products/accessories
-    - lets Groq AI make the final judgement
+    - uses title + description + brand + raw text from Vinted
+    - avoids overly strict filters for iPad/Redmi
+    - but Apple Watch search is specifically for SE 2, not SE 1
+    - lets Groq AI make the final judgement after basic matching
     """
     if not REJECT_ACCESSORIES:
         return True, "product filter disabled"
@@ -537,8 +537,6 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         return None
 
     if profile == "ipad":
-        # Broad iPad search is OK, but item must really mention iPad somewhere
-        # in title/description/brand/raw Apify text.
         if "ipad" not in combined:
             return False, "missing ipad keyword in title/description"
 
@@ -547,41 +545,55 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
 
         accessory = title_has_accessory()
         if accessory:
-            # Reject obvious accessory-only listings.
-            # If the description also has device-like details, let it pass to AI.
-            device_hints = ["gb", "wifi", "wi-fi", "cellular", "tablet", "generacji", "gen", "a16", "2021", "2022", "10.9", "10,9"]
+            device_hints = [
+                "gb", "wifi", "wi-fi", "cellular", "tablet", "generacji",
+                "gen", "a16", "2021", "2022", "10.9", "10,9"
+            ]
             if not has_any(combined, device_hints):
                 return False, f"likely ipad accessory only: {accessory}"
 
         return True, "ipad broad filter ok"
 
     if profile == "apple_watch_se":
-        # Important: sellers often put "SE 2" only in description, not in title.
-        # So we require only Apple + Watch somewhere, and reject obvious non-SE series.
+        # We are looking specifically for Apple Watch SE 2.
+        # Sellers may write SE 2 only in description, so check combined text.
         if not ("apple" in combined and "watch" in combined):
             return False, "missing apple watch keywords in title/description"
 
-        # Reject obvious different lines.
+        # Reject obvious other lines.
         if has_any(combined, [
             "series 1", "series 2", "series 3", "series 4", "series 5",
             "series 6", "series 7", "series 8", "series 9", "series 10",
-            "ultra"
+            "series 11", "ultra"
         ]):
             return False, "wrong apple watch series"
 
+        # SE 2 allowlist. This is intentionally stricter than before.
+        # Plain "Apple Watch SE 40mm" is probably SE 1, so reject it.
+        se2_hints = [
+            "se 2", "se2", "se 2gen", "se 2 gen", "se gen 2",
+            "se 2 generacji", "se 2. generacji",
+            "2 generacji", "2. generacji", "drugiej generacji",
+            "2nd gen", "2nd generation", "second generation",
+            "se 2022", "se 2023", "apple watch se 2", "apple watch se2"
+        ]
+
+        if not has_any(combined, se2_hints):
+            return False, "apple watch is not clearly SE 2"
+
         accessory = title_has_accessory()
         if accessory:
-            # Reject accessory-only listings like "pasek do Apple Watch".
-            # But pass real watches with "akcesoria", "gps", "44mm", "40mm", "se" etc.
-            device_hints = ["se", "gps", "40mm", "44mm", "40 mm", "44 mm", "watch se", "kondycja baterii", "bateria", "zegarek"]
+            device_hints = [
+                "se 2", "2 generacji", "2. generacji", "gps", "40mm", "44mm",
+                "40 mm", "44 mm", "watch se", "kondycja baterii", "bateria", "zegarek"
+            ]
             if not has_any(combined, device_hints):
                 return False, f"likely apple watch accessory only: {accessory}"
 
-        return True, "apple watch broad filter ok"
+        return True, "apple watch se 2 filter ok"
 
     if profile == "redmi_pad_pro":
-        # We still keep Redmi strict enough: it must be Redmi + Pad + Pro.
-        # This prevents Redmi Pad SE / Redmi Pad / Redmi phones.
+        # Keep Redmi strict: must be Redmi + Pad + Pro.
         if not ("redmi" in combined and "pad" in combined):
             return False, "missing redmi pad keywords in title/description"
 
