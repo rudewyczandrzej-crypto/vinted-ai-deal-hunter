@@ -452,11 +452,11 @@ def has_any(text: str, words: List[str]) -> bool:
 
 def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> Tuple[bool, str]:
     """
-    Reject accessories and mismatched products after a broad Vinted search.
-    Uses allowlist for target models, so broad searches stay cheap:
-    /add ipad до 1100
-    /add apple watch se до 500
-    /add redmi pad pro до 850
+    Simpler product filter:
+    - uses title + description + brand + raw text from Apify
+    - avoids very strict allowlists that can miss good listings
+    - rejects obvious wrong products/accessories
+    - lets Groq AI make the final judgement
     """
     if not REJECT_ACCESSORIES:
         return True, "product filter disabled"
@@ -464,55 +464,81 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
     text = item_searchable_text(raw)
     profile = detect_search_profile(search_keyword)
 
-    # Universal accessory rejection for our target electronics searches.
-    if profile in ["ipad", "apple_watch_se", "redmi_pad_pro"]:
+    title = str(get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "")).lower()
+    description = str(get_first_existing(raw, ["description", "desc"], "")).lower()
+    brand = str(get_first_existing(raw, ["brand", "brandTitle", "brand_name"], "")).lower()
+    condition = str(get_first_existing(raw, ["condition", "status"], "")).lower()
+
+    combined = f"{title} | {description} | {brand} | {condition} | {text}"
+
+    def title_has_accessory() -> Optional[str]:
         for keyword in ACCESSORY_KEYWORDS:
-            if keyword and keyword in text:
-                return False, f"accessory keyword: {keyword}"
+            if keyword and keyword in title:
+                return keyword
+        return None
 
     if profile == "ipad":
-        if "ipad" not in text:
-            return False, "missing ipad keyword"
+        # Broad iPad search is OK, but item must really mention iPad somewhere
+        # in title/description/brand/raw Apify text.
+        if "ipad" not in combined:
+            return False, "missing ipad keyword in title/description"
 
-        if has_any(text, ["iphone", "macbook", "airpods", "apple watch"]):
+        if has_any(combined, ["iphone", "macbook", "airpods", "apple watch"]):
             return False, "wrong Apple product"
 
-        if ENABLE_MODEL_ALLOWLIST:
-            if not has_any(text, IPAD_ALLOWED_KEYWORDS):
-                return False, "ipad not in allowed model list"
+        accessory = title_has_accessory()
+        if accessory:
+            # Reject obvious accessory-only listings.
+            # If the description also has device-like details, let it pass to AI.
+            device_hints = ["gb", "wifi", "wi-fi", "cellular", "tablet", "generacji", "gen", "a16", "2021", "2022", "10.9", "10,9"]
+            if not has_any(combined, device_hints):
+                return False, f"likely ipad accessory only: {accessory}"
 
-        return True, "ipad allowed model ok"
+        return True, "ipad broad filter ok"
 
     if profile == "apple_watch_se":
-        if not ("apple" in text and "watch" in text):
-            return False, "missing apple watch keywords"
+        # Important: sellers often put "SE 2" only in description, not in title.
+        # So we require only Apple + Watch somewhere, and reject obvious non-SE series.
+        if not ("apple" in combined and "watch" in combined):
+            return False, "missing apple watch keywords in title/description"
 
-        if ENABLE_MODEL_ALLOWLIST:
-            if not has_any(text, APPLE_WATCH_SE_ALLOWED_KEYWORDS):
-                return False, "apple watch not in SE allowlist"
-
-        # Extra protection: if listing clearly says a non-SE series, reject it.
-        if has_any(text, [
+        # Reject obvious different lines.
+        if has_any(combined, [
             "series 1", "series 2", "series 3", "series 4", "series 5",
             "series 6", "series 7", "series 8", "series 9", "series 10",
             "ultra"
         ]):
             return False, "wrong apple watch series"
 
-        return True, "apple watch se allowed model ok"
+        accessory = title_has_accessory()
+        if accessory:
+            # Reject accessory-only listings like "pasek do Apple Watch".
+            # But pass real watches with "akcesoria", "gps", "44mm", "40mm", "se" etc.
+            device_hints = ["se", "gps", "40mm", "44mm", "40 mm", "44 mm", "watch se", "kondycja baterii", "bateria", "zegarek"]
+            if not has_any(combined, device_hints):
+                return False, f"likely apple watch accessory only: {accessory}"
+
+        return True, "apple watch broad filter ok"
 
     if profile == "redmi_pad_pro":
-        if not ("redmi" in text and "pad" in text and "pro" in text):
-            return False, "missing redmi pad pro keywords"
+        # We still keep Redmi strict enough: it must be Redmi + Pad + Pro.
+        # This prevents Redmi Pad SE / Redmi Pad / Redmi phones.
+        if not ("redmi" in combined and "pad" in combined):
+            return False, "missing redmi pad keywords in title/description"
 
-        if has_any(text, ["redmi note", "xiaomi note", "telefon", "smartfon", "phone"]):
+        if "pro" not in combined:
+            return False, "missing pro keyword for redmi pad pro"
+
+        if has_any(combined, ["redmi note", "xiaomi note", "telefon", "smartfon", "phone"]):
             return False, "wrong redmi product"
 
-        if ENABLE_MODEL_ALLOWLIST:
-            if not has_any(text, REDMI_PAD_PRO_ALLOWED_KEYWORDS):
-                return False, "redmi pad pro not in allowed model list"
+        accessory = title_has_accessory()
+        if accessory:
+            device_hints = ["tablet", "gb", "6/128", "8/256", "12.1", "12,1", "hyperos", "android"]
+            if not has_any(combined, device_hints):
+                return False, f"likely redmi accessory only: {accessory}"
 
-        return True, "redmi pad pro allowed model ok"
+        return True, "redmi pad pro broad filter ok"
 
     return True, "generic profile ok"
 
@@ -1010,7 +1036,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 Я шукаю свіжі оферти на Vinted і оцінюю їх через Groq AI.
 
 <b>Зараз фільтр:</b>
-тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>\nІ відкидаю аксесуари: <b>etui, folia, szkło, ładowarka, pasek</b>\nТакож пропускаю тільки потрібні моделі через <b>allowlist</b>.
+тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>\nІ відкидаю аксесуари: <b>etui, folia, szkło, ładowarka, pasek</b>\nФільтр спрощений: перевіряю назву + опис + бренд, а фінальну оцінку дає AI.
 
 <b>Команди:</b>
 
