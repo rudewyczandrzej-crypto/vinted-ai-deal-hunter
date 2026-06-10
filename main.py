@@ -75,13 +75,13 @@ BAD_KEYWORDS = [
         "porysowany ekran,rysy na ekranie,"
         "nie działa,nie dziala,niedziała,niedziala,"
         "części,czesci,na części,na czesci,"
-        "blokada,icloud,apple id,appleid,"
-        "zablokowany,zablokowana,zablokowane,"
-        "zablokowany apple id,zablokowane apple id,blokada apple id,"
-        "blokada icloud,icloud lock,activation lock,"
+        "blokada apple id,blokada icloud,icloud lock,activation lock,"
+        "zablokowany apple id,zablokowana apple id,zablokowane apple id,"
+        "zablokowany icloud,zablokowana icloud,zablokowane icloud,"
+        "apple id locked,icloud locked,locked apple id,locked icloud,"
         "brak hasła,brak hasla,nie znam hasła,nie znam hasla,"
-        "wylogowany nie jest,nie wylogowany,nie wylogowana,"
-        "locked,account locked,apple id locked,"
+        "nie wylogowany z icloud,nie wylogowana z icloud,"
+        "nie wylogowany apple id,nie wylogowana apple id,"
         "cracked,broken,damaged,for parts,not working"
     ).split(",")
     if x.strip()
@@ -467,6 +467,77 @@ def item_searchable_text(raw: Dict[str, Any]) -> str:
     return f"{title} | {description} | {condition} | {brand} | {flat}".lower()
 
 
+def has_bad_apple_lock_context(text: str) -> Tuple[bool, str]:
+    """
+    Smart iCloud / Apple ID check.
+    Allows good context like "wylogowany z iCloud" or "bez blokady iCloud",
+    rejects bad context like "blokada iCloud" or "activation lock".
+    """
+    t = (text or "").lower()
+
+    good_phrases = [
+        "icloud wylogowany",
+        "wylogowany z icloud",
+        "wylogowana z icloud",
+        "wylogowane z icloud",
+        "bez blokady icloud",
+        "bez blokady apple id",
+        "apple id usunięte",
+        "apple id usuniete",
+        "usunięte apple id",
+        "usuniete apple id",
+        "zresetowany",
+        "zresetowana",
+        "zresetowane",
+        "gotowy do sparowania",
+        "gotowa do sparowania",
+        "gotowe do sparowania",
+        "bez icloud lock",
+        "no icloud lock",
+        "icloud clean",
+        "apple id clean",
+    ]
+
+    bad_phrases = [
+        "blokada icloud",
+        "blokada apple id",
+        "zablokowany icloud",
+        "zablokowana icloud",
+        "zablokowane icloud",
+        "zablokowany apple id",
+        "zablokowana apple id",
+        "zablokowane apple id",
+        "icloud lock",
+        "activation lock",
+        "apple id locked",
+        "icloud locked",
+        "locked apple id",
+        "locked icloud",
+        "brak hasła",
+        "brak hasla",
+        "nie znam hasła",
+        "nie znam hasla",
+        "nie wylogowany z icloud",
+        "nie wylogowana z icloud",
+        "nie wylogowany apple id",
+        "nie wylogowana apple id",
+    ]
+
+    if any(p in t for p in good_phrases):
+        return False, "good apple lock context"
+
+    for phrase in bad_phrases:
+        if phrase in t:
+            return True, f"bad apple lock context: {phrase}"
+
+    if ("zablokowany" in t or "zablokowana" in t or "zablokowane" in t or "locked" in t) and (
+        "icloud" in t or "apple id" in t or "appleid" in t
+    ):
+        return True, "bad apple lock context: locked with apple/icloud"
+
+    return False, "no bad apple lock context"
+
+
 def passes_quality_filter(raw: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Reject obviously bad electronics before spending Groq tokens.
@@ -479,6 +550,10 @@ def passes_quality_filter(raw: Dict[str, Any]) -> Tuple[bool, str]:
     condition = str(get_first_existing(raw, ["condition", "status"], "")).strip().lower()
     if condition and any(bad == condition or bad in condition for bad in BAD_CONDITIONS):
         return False, f"bad condition: {condition}"
+
+    apple_lock_bad, apple_lock_reason = has_bad_apple_lock_context(text)
+    if apple_lock_bad:
+        return False, apple_lock_reason
 
     for keyword in BAD_KEYWORDS:
         if keyword and keyword in text:
@@ -631,13 +706,50 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         if has_any(combined, ["redmi note", "xiaomi note", "telefon", "smartfon", "phone"]):
             return False, "wrong redmi product"
 
+        # We want Redmi Pad Pro 2 / newer, not first generation Redmi Pad Pro.
+        # Good hints can be in title or description.
+        redmi_pro2_hints = [
+            "redmi pad pro 2",
+            "pad pro 2",
+            "2 generacji",
+            "2. generacji",
+            "drugiej generacji",
+            "2 gen",
+            "2gen",
+            "2025",
+            "snapdragon 7s",
+            "7s gen 2",
+            "7s gen2",
+            "12.1",
+            "12,1",
+            "hyperos 2",
+            "mi pad pro 2"
+        ]
+
+        redmi_old_hints = [
+            "redmi pad pro 1",
+            "pad pro 1",
+            "1 generacji",
+            "1. generacji",
+            "pierwszej generacji",
+            "1 gen",
+            "1gen",
+            "2024"
+        ]
+
+        if has_any(combined, redmi_old_hints):
+            return False, "redmi pad pro first generation rejected"
+
+        if not has_any(combined, redmi_pro2_hints):
+            return False, "redmi pad pro is not clearly 2nd generation/newer"
+
         accessory = title_has_accessory()
         if accessory:
-            device_hints = ["tablet", "gb", "6/128", "8/256", "12.1", "12,1", "hyperos", "android"]
+            device_hints = ["tablet", "gb", "6/128", "8/256", "12.1", "12,1", "hyperos", "android", "2025", "2 gen"]
             if not has_any(combined, device_hints):
                 return False, f"likely redmi accessory only: {accessory}"
 
-        return True, "redmi pad pro broad filter ok"
+        return True, "redmi pad pro 2/newer filter ok"
 
     return True, "generic profile ok"
 
