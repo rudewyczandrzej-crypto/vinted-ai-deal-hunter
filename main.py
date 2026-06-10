@@ -376,27 +376,69 @@ def parse_datetime_to_age_minutes(value: Any) -> Optional[int]:
 
 
 def get_item_age_minutes(raw: Dict[str, Any]) -> Tuple[Optional[int], str]:
-    time_keys = [
-        "createdAt", "created_at", "created", "creationDate", "creation_date",
-        "publishedAt", "published_at", "published", "publicationDate", "publication_date",
-        "updatedAt", "updated_at", "lastUpdated", "last_updated",
-        "uploadedAt", "uploaded_at", "date", "time", "timestamp",
-        "relativeDate", "relative_date", "createdAgo", "created_ago", "addedAgo", "added_ago",
+    """
+    Try to detect listing age safely.
+
+    Important direct-mode fix:
+    Do NOT scan every nested timestamp in raw JSON, because Vinted returns many unrelated
+    old timestamps in metadata. We only trust explicit item date/relative age fields.
+    """
+
+    # 1. Direct explicit item-level fields only.
+    explicit_keys = [
+        "createdAt", "created_at", "created",
+        "created_at_ts", "created_ts",
+        "publishedAt", "published_at", "published",
+        "updatedAt", "updated_at",
+        "uploadedAt", "uploaded_at",
+        "date", "time",
+        "relativeDate", "relative_date",
+        "createdAgo", "created_ago",
+        "addedAgo", "added_ago",
         "added", "dodane"
     ]
 
-    direct = deep_find_key(raw, time_keys)
-    age = parse_datetime_to_age_minutes(direct)
-    if age is not None:
-        return age, f"field={direct}"
+    for key in explicit_keys:
+        if isinstance(raw, dict) and key in raw and raw[key] not in [None, ""]:
+            age = parse_datetime_to_age_minutes(raw[key])
+            if age is not None:
+                return age, f"explicit_field={key}:{raw[key]}"
 
-    flat = flatten_text_values(raw)
-    age = parse_age_minutes_from_text(flat)
+    # 2. Direct nested item object, only if known wrappers exist.
+    for wrapper_key in ["item", "listing", "product"]:
+        nested = raw.get(wrapper_key) if isinstance(raw, dict) else None
+        if isinstance(nested, dict):
+            for key in explicit_keys:
+                if key in nested and nested[key] not in [None, ""]:
+                    age = parse_datetime_to_age_minutes(nested[key])
+                    if age is not None:
+                        return age, f"nested_field={wrapper_key}.{key}:{nested[key]}"
+
+    # 3. Text-based relative age from visible listing text.
+    # This catches "Dodane 8 min.", "Uploaded 8 min ago", "2 godz." if present.
+    visible_text_parts = []
+    for key in [
+        "title", "name", "description", "desc", "status", "condition",
+        "createdAgo", "created_ago", "addedAgo", "added_ago",
+        "relativeDate", "relative_date", "added", "dodane"
+    ]:
+        if isinstance(raw, dict) and key in raw and isinstance(raw[key], str):
+            visible_text_parts.append(raw[key])
+
+    # Some Vinted direct responses may include visible text in a few nested safe places.
+    for wrapper_key in ["item", "listing", "product"]:
+        nested = raw.get(wrapper_key) if isinstance(raw, dict) else None
+        if isinstance(nested, dict):
+            for key in ["title", "description", "status", "createdAgo", "addedAgo", "relativeDate", "added", "dodane"]:
+                if key in nested and isinstance(nested[key], str):
+                    visible_text_parts.append(nested[key])
+
+    visible_text = " | ".join(visible_text_parts)
+    age = parse_age_minutes_from_text(visible_text)
     if age is not None:
-        return age, "flattened_text"
+        return age, "visible_text"
 
     return None, "unknown"
-
 
 def is_recent_item(raw: Dict[str, Any]) -> Tuple[bool, str]:
     age_minutes, source = get_item_age_minutes(raw)
