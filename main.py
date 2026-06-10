@@ -314,7 +314,7 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
 
     payload = build_apify_input(keyword, max_price)
 
-    logger.info("Running Apify actor %s with input: %s", APIFY_ACTOR_ID, payload)
+    logger.info("TEST VERSION 123 | Running Apify actor %s with input: %s", APIFY_ACTOR_ID, payload)
 
     response = requests.post(
         url,
