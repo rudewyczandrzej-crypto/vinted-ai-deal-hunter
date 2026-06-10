@@ -1532,7 +1532,8 @@ def main() -> None:
         name="scheduled_vinted_check",
     )
 
-    init_vinted_session()\n    logger.info("Bot started in DIRECT VINTED mode. Freshness filter: ONLY_RECENT_MINUTES=%s SKIP_UNKNOWN_AGE=%s", ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
+    init_vinted_session()
+    logger.info("Bot started in DIRECT VINTED mode. Freshness filter: ONLY_RECENT_MINUTES=%s SKIP_UNKNOWN_AGE=%s", ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
