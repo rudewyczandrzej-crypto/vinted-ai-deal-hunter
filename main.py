@@ -290,9 +290,10 @@ def mark_item_sent(telegram_id: str, search_id: int, item_id: str, url: str) -> 
 def build_apify_input(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
     """
     Input for automation-lab/vinted-scraper.
+    This actor requires searchQuery.
     """
     actor_input = {
-        "query": keyword,
+        "searchQuery": keyword,
         "domain": DEFAULT_COUNTRY_DOMAIN,
         "maxItems": MAX_ITEMS_PER_SEARCH,
     }
