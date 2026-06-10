@@ -5,6 +5,7 @@ import html
 import time
 import logging
 import traceback
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -39,8 +40,16 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-MAX_ITEMS_PER_SEARCH = int(os.getenv("MAX_ITEMS_PER_SEARCH", "10"))
-MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "6"))
+MAX_ITEMS_PER_SEARCH = int(os.getenv("MAX_ITEMS_PER_SEARCH", "20"))
+MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "4"))
+
+# New freshness filter.
+ONLY_RECENT_MINUTES = int(os.getenv("ONLY_RECENT_MINUTES", "5"))
+
+# If Apify does not return age/date:
+# true  = skip item, safer, avoids old listings
+# false = allow item, may send old listings
+SKIP_UNKNOWN_AGE = os.getenv("SKIP_UNKNOWN_AGE", "true").lower() in ["1", "true", "yes", "y"]
 
 DEFAULT_COUNTRY_DOMAIN = "vinted.pl"
 
@@ -68,7 +77,7 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 # =========================
-# SMALL HELPERS
+# HELPERS
 # =========================
 
 def escape(value: Any) -> str:
@@ -81,6 +90,12 @@ def normalize_price(value: Any) -> Optional[float]:
 
     if isinstance(value, (int, float)):
         return float(value)
+
+    if isinstance(value, dict):
+        for key in ["amount", "value", "price", "numeric"]:
+            if key in value:
+                return normalize_price(value[key])
+        return None
 
     text = str(value)
     text = text.replace(",", ".")
@@ -102,13 +117,6 @@ def extract_number(text: str) -> Optional[float]:
 
 
 def parse_add_command(raw_text: str) -> Tuple[Optional[str], Optional[float]]:
-    """
-    Supported:
-    /add ipad до 1200
-    /add iphone 13 | 1000
-    /add apple watch series 7 max 450
-    /add steam deck 1500
-    """
     text = raw_text.replace("/add", "", 1).strip()
 
     if not text:
@@ -117,14 +125,12 @@ def parse_add_command(raw_text: str) -> Tuple[Optional[str], Optional[float]]:
     max_price = None
     keyword = text
 
-    # format: keyword | price
     if "|" in text:
         parts = [p.strip() for p in text.split("|", 1)]
         keyword = parts[0]
         max_price = extract_number(parts[1])
         return keyword.strip(), max_price
 
-    # formats: до 1200, max 1200, price 1200
     price_patterns = [
         r"\bдо\s+(\d+(?:[,.]\d+)?)",
         r"\bmax\s+(\d+(?:[,.]\d+)?)",
@@ -139,7 +145,6 @@ def parse_add_command(raw_text: str) -> Tuple[Optional[str], Optional[float]]:
             keyword = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
             return keyword.strip(), max_price
 
-    # If last word is a number, treat it as max price
     parts = text.split()
     if len(parts) >= 2 and re.fullmatch(r"\d+(?:[,.]\d+)?", parts[-1]):
         max_price = float(parts[-1].replace(",", "."))
@@ -155,11 +160,151 @@ def get_first_existing(data: Dict[str, Any], keys: List[str], default: Any = Non
     return default
 
 
+def deep_find_key(data: Any, possible_keys: List[str]) -> Any:
+    if isinstance(data, dict):
+        for key in possible_keys:
+            if key in data and data[key] not in [None, ""]:
+                return data[key]
+        for value in data.values():
+            found = deep_find_key(value, possible_keys)
+            if found not in [None, ""]:
+                return found
+
+    if isinstance(data, list):
+        for item in data:
+            found = deep_find_key(item, possible_keys)
+            if found not in [None, ""]:
+                return found
+
+    return None
+
+
+def flatten_text_values(data: Any, limit: int = 120) -> str:
+    values = []
+
+    def walk(x: Any):
+        if len(values) >= limit:
+            return
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+        elif isinstance(x, str):
+            s = x.strip()
+            if 0 < len(s) <= 120:
+                values.append(s)
+
+    walk(data)
+    return " | ".join(values)
+
+
+def parse_age_minutes_from_text(text: str) -> Optional[int]:
+    if not text:
+        return None
+
+    t = text.lower()
+
+    m = re.search(r"(\d+)\s*(min|min\.|minut|minuty|minuta)", t)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r"(\d+)\s*(h|godz|godz\.|godzin|godziny|godzinę)", t)
+    if m:
+        return int(m.group(1)) * 60
+
+    m = re.search(r"(\d+)\s*(d|dzień|dni|dnia)", t)
+    if m:
+        return int(m.group(1)) * 24 * 60
+
+    if any(word in t for word in ["tydz", "tydzień", "tygodni", "mies", "miesiąc", "rok", "lat"]):
+        return 999999
+
+    if any(word in t for word in ["przed chwilą", "teraz", "now", "just now"]):
+        return 0
+
+    return None
+
+
+def parse_datetime_to_age_minutes(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        try:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return max(0, int((now - dt).total_seconds() / 60))
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+
+        text_age = parse_age_minutes_from_text(s)
+        if text_age is not None:
+            return text_age
+
+        if re.fullmatch(r"\d{10,13}", s):
+            return parse_datetime_to_age_minutes(int(s))
+
+        try:
+            iso = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0, int((now - dt.astimezone(timezone.utc)).total_seconds() / 60))
+        except Exception:
+            return None
+
+    return None
+
+
+def get_item_age_minutes(raw: Dict[str, Any]) -> Tuple[Optional[int], str]:
+    time_keys = [
+        "createdAt", "created_at", "created", "creationDate", "creation_date",
+        "publishedAt", "published_at", "published", "publicationDate", "publication_date",
+        "updatedAt", "updated_at", "lastUpdated", "last_updated",
+        "uploadedAt", "uploaded_at", "date", "time", "timestamp",
+        "relativeDate", "relative_date", "createdAgo", "created_ago", "addedAgo", "added_ago",
+        "added", "dodane"
+    ]
+
+    direct = deep_find_key(raw, time_keys)
+    age = parse_datetime_to_age_minutes(direct)
+    if age is not None:
+        return age, f"field={direct}"
+
+    flat = flatten_text_values(raw)
+    age = parse_age_minutes_from_text(flat)
+    if age is not None:
+        return age, "flattened_text"
+
+    return None, "unknown"
+
+
+def is_recent_item(raw: Dict[str, Any]) -> Tuple[bool, str]:
+    age_minutes, source = get_item_age_minutes(raw)
+
+    if age_minutes is None:
+        if SKIP_UNKNOWN_AGE:
+            return False, f"unknown age skipped ({source})"
+        return True, f"unknown age allowed ({source})"
+
+    if age_minutes <= ONLY_RECENT_MINUTES:
+        return True, f"{age_minutes} min old ({source})"
+
+    return False, f"{age_minutes} min old, older than {ONLY_RECENT_MINUTES} min ({source})"
+
+
 def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Different Apify Vinted actors return slightly different field names.
-    This function tries to normalize the most common variants.
-    """
     title = get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "No title")
     url = get_first_existing(raw, ["url", "itemUrl", "link", "productUrl", "item_url"], "")
     item_id = get_first_existing(raw, ["id", "itemId", "item_id", "productId"], url)
@@ -181,9 +326,12 @@ def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     location = get_first_existing(raw, ["location", "city", "country"], "")
 
     image = get_first_existing(raw, ["image", "imageUrl", "photo", "thumbnail", "photoUrl"], "")
+    images = get_first_existing(raw, ["images", "photos", "photoUrls", "imageUrls"], [])
 
     if isinstance(seller, dict):
         seller = get_first_existing(seller, ["login", "username", "name"], "")
+
+    age_minutes, age_source = get_item_age_minutes(raw)
 
     return {
         "id": str(item_id),
@@ -198,6 +346,9 @@ def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
         "seller": str(seller),
         "location": str(location),
         "image": str(image),
+        "images": images,
+        "age_minutes": age_minutes,
+        "age_source": age_source,
         "raw": raw,
     }
 
@@ -279,7 +430,6 @@ def mark_item_sent(telegram_id: str, search_id: int, item_id: str, url: str) -> 
             "url": url,
         }).execute()
     except Exception:
-        # Unique constraint may fail if two checks overlap. Safe to ignore.
         logger.warning("Could not mark item as sent, probably duplicate.")
 
 
@@ -288,10 +438,6 @@ def mark_item_sent(telegram_id: str, search_id: int, item_id: str, url: str) -> 
 # =========================
 
 def build_apify_input(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
-    """
-    Input for automation-lab/vinted-scraper.
-    This actor requires searchQuery.
-    """
     actor_input = {
         "searchQuery": keyword,
         "domain": DEFAULT_COUNTRY_DOMAIN,
@@ -314,7 +460,7 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
 
     payload = build_apify_input(keyword, max_price)
 
-    logger.info("TEST VERSION 123 | Running Apify actor %s with input: %s", APIFY_ACTOR_ID, payload)
+    logger.info("Running Apify actor %s with input: %s", APIFY_ACTOR_ID, payload)
 
     response = requests.post(
         url,
@@ -333,9 +479,33 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
         logger.warning("Unexpected Apify response: %s", str(data)[:1000])
         return []
 
-    normalized = [normalize_item(item) for item in data if isinstance(item, dict)]
+    filtered_recent = []
+    skipped_old = 0
+    skipped_unknown = 0
 
-    # Local price filter
+    for raw_item in data:
+        if not isinstance(raw_item, dict):
+            continue
+
+        ok, reason = is_recent_item(raw_item)
+
+        if not ok:
+            if "unknown age" in reason:
+                skipped_unknown += 1
+            else:
+                skipped_old += 1
+            logger.info("Skipped item by age: %s", reason)
+            continue
+
+        filtered_recent.append(raw_item)
+
+    logger.info(
+        "Freshness filter: input=%s kept=%s skipped_old=%s skipped_unknown=%s only_recent=%smin skip_unknown=%s",
+        len(data), len(filtered_recent), skipped_old, skipped_unknown, ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE
+    )
+
+    normalized = [normalize_item(item) for item in filtered_recent if isinstance(item, dict)]
+
     if max_price:
         normalized = [
             item for item in normalized
@@ -358,7 +528,6 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
     except Exception:
-        # Try to extract the first JSON object from a messy model response.
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -367,8 +536,20 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
 
 
 def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[str, Any]:
+    images_info = "немає даних про фото"
+    images = item.get("images")
+    if isinstance(images, list):
+        images_info = f"кількість фото: {len(images)}"
+    elif item.get("image"):
+        images_info = "є мінімум одне фото"
+
     prompt = f"""
 Ти AI-агент для оцінки оголошень з Vinted у Польщі.
+
+ВАЖЛИВО:
+- Ти НЕ бачиш фото напряму.
+- Якщо з тексту/метаданих не видно технічного стану, вважай це ризиком.
+- Для Apple Watch / iPad / техніки завжди проси фото стану екрана, серійний номер/модель, iCloud/Apple ID logout, батарею якщо доступно.
 
 Задача користувача:
 - шукає: {search.get("keyword")}
@@ -382,6 +563,8 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
 - condition: {item.get("condition")}
 - seller: {item.get("seller")}
 - location: {item.get("location")}
+- age_minutes: {item.get("age_minutes")}
+- images_info: {images_info}
 - description: {item.get("description")}
 - url: {item.get("url")}
 
@@ -389,6 +572,8 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
 Особливо уважно шукай ризики:
 - uszkodzony
 - pęknięty
+- zbity ekran
+- porysowany ekran
 - nie działa
 - iCloud
 - blokada
@@ -398,6 +583,7 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
 - podejrzanie niska cena
 - занадто короткий опис
 - техніка без перевірки
+- продавець вказав загальний стан, але без технічних деталей
 
 Відповідай тільки JSON без markdown:
 {{
@@ -443,7 +629,7 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
             "verdict": "не вдалося повністю оцінити",
             "reason": "AI-оцінка Groq не спрацювала, але оголошення підходить під фільтр.",
             "risk_flags": [],
-            "message_to_seller_pl": "Dzień dobry, czy oferta jest nadal aktualna?",
+            "message_to_seller_pl": "Dzień dobry, czy oferta jest nadal aktualna? Czy można prosić o więcej zdjęć i informacje o stanie technicznym?",
         }
 
 
@@ -461,6 +647,10 @@ def format_item_message(item: Dict[str, Any], ai: Dict[str, Any], search: Dict[s
 
     url = item.get("url") or ""
 
+    age_text = "н/д"
+    if item.get("age_minutes") is not None:
+        age_text = f'{item.get("age_minutes")} хв тому'
+
     message = f"""
 🔥 <b>Нова оферта з Vinted</b>
 
@@ -469,6 +659,7 @@ def format_item_message(item: Dict[str, Any], ai: Dict[str, Any], search: Dict[s
 💰 <b>Ціна:</b> {escape(price_text)}
 🏷 <b>Бренд:</b> {escape(item.get("brand") or "н/д")}
 📌 <b>Стан:</b> {escape(item.get("condition") or "н/д")}
+🕒 <b>Додано:</b> {escape(age_text)}
 
 🤖 <b>AI-оцінка:</b> {escape(ai.get("score"))}/10
 ✅ <b>Вердикт:</b> {escape(ai.get("verdict"))}
@@ -508,7 +699,10 @@ async def process_search(
             if manual:
                 await application.bot.send_message(
                     chat_id=telegram_id,
-                    text=f"Нічого не знайшов по пошуку: {keyword}",
+                    text=(
+                        f"Нічого свіжого не знайшов по пошуку: {keyword}\n"
+                        f"Фільтр: тільки останні {ONLY_RECENT_MINUTES} хв."
+                    ),
                 )
             return 0
 
@@ -524,7 +718,6 @@ async def process_search(
             ai = evaluate_item_with_ai(item, search)
             score = int(ai.get("score", 0))
 
-            # Mark as sent even if score is low, to avoid repeated spam with bad offers.
             mark_item_sent(telegram_id, search_id, str(item_id), item.get("url") or "")
 
             if score < MIN_AI_SCORE_TO_SEND:
@@ -541,8 +734,6 @@ async def process_search(
             )
 
             sent_count += 1
-
-            # Small pause to avoid Telegram flood
             time.sleep(0.5)
 
     except Exception as e:
@@ -591,10 +782,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     telegram_id = str(chat.id)
     ensure_user(telegram_id)
 
-    text = """
+    text = f"""
 👋 Привіт! Я <b>Vinted AI Deal Hunter</b>.
 
-Я можу шукати оферти на Vinted і оцінювати їх через Groq AI.
+Я шукаю свіжі оферти на Vinted і оцінюю їх через Groq AI.
+
+<b>Зараз фільтр:</b>
+тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>
 
 <b>Команди:</b>
 
@@ -607,16 +801,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 /help
 
 <b>Приклад:</b>
-<code>/add apple watch series 7 до 450</code>
-
-Я буду шукати нові оголошення, фільтрувати по ціні, оцінювати ризики і присилати тільки нормальні оферти.
+<code>/add apple watch se до 500</code>
 """
 
     await update.message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = """
+    text = f"""
 <b>Як користуватись:</b>
 
 1. Додати пошук:
@@ -634,10 +826,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 5. Тест Apify:
 <code>/debug ipad</code>
 
+<b>Фільтр свіжості:</b>
+тільки останні {ONLY_RECENT_MINUTES} хв.
+
 <b>Формати /add:</b>
 <code>/add ipad до 1200</code>
 <code>/add iphone 13 | 1000</code>
-<code>/add apple watch series 7 max 450</code>
+<code>/add apple watch se max 500</code>
 """
 
     await update.message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
@@ -668,7 +863,8 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await message.reply_text(
         f"✅ Додав пошук #{created['id']}:\n"
         f"🔎 {keyword}\n"
-        f"💰 {price_text}\n\n"
+        f"💰 {price_text}\n"
+        f"🕒 Тільки останні {ONLY_RECENT_MINUTES} хв.\n\n"
         f"Можеш вручну перевірити командою /check",
     )
 
@@ -687,7 +883,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("У тебе поки немає активних пошуків. Додай: /add ipad до 1200")
         return
 
-    lines = ["📋 <b>Твої активні пошуки:</b>\n"]
+    lines = [f"📋 <b>Твої активні пошуки:</b>\n🕒 Фільтр: останні {ONLY_RECENT_MINUTES} хв.\n"]
 
     for s in searches:
         price = s.get("max_price")
@@ -739,7 +935,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("У тебе немає активних пошуків. Додай: /add ipad до 1200")
         return
 
-    await message.reply_text("🔍 Перевіряю Vinted...")
+    await message.reply_text(f"🔍 Перевіряю Vinted. Беру тільки останні {ONLY_RECENT_MINUTES} хв...")
 
     total_sent = 0
 
@@ -748,16 +944,12 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         total_sent += sent
 
     if total_sent == 0:
-        await message.reply_text("Поки не знайшов нових нормальних оферт.")
+        await message.reply_text("Поки не знайшов нових нормальних свіжих оферт.")
     else:
         await message.reply_text(f"✅ Готово. Нових оферт: {total_sent}")
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Optional command for testing Apify response.
-    Use: /debug ipad
-    """
     chat = update.effective_chat
     message = update.message
 
@@ -769,13 +961,33 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await message.reply_text(f"Тестую Apify по запиту: {keyword}")
 
     try:
-        items = fetch_vinted_items(keyword, None)
+        actor_id_for_url = APIFY_ACTOR_ID.replace("/", "~")
+        url = (
+            f"https://api.apify.com/v2/acts/"
+            f"{actor_id_for_url}/run-sync-get-dataset-items"
+            f"?token={APIFY_TOKEN}"
+        )
+        payload = build_apify_input(keyword, None)
 
-        if not items:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=120,
+            headers={"Content-Type": "application/json"},
+        )
+
+        if response.status_code >= 400:
+            await message.reply_text(f"Debug error: Apify error {response.status_code}: {response.text[:800]}")
+            return
+
+        data = response.json()
+        if not isinstance(data, list) or not data:
             await message.reply_text("Apify повернув 0 items.")
             return
 
-        first = items[0]
+        first_raw = data[0]
+        first = normalize_item(first_raw)
+        ok, reason = is_recent_item(first_raw)
 
         text = f"""
 <b>Перший item:</b>
@@ -785,6 +997,9 @@ price: {escape(first.get("price"))}
 url: {escape(first.get("url"))}
 brand: {escape(first.get("brand"))}
 condition: {escape(first.get("condition"))}
+age_minutes: {escape(first.get("age_minutes"))}
+recent_filter: {escape(ok)}
+reason: {escape(reason)}
 """
 
         await message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
@@ -808,8 +1023,6 @@ def main() -> None:
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("debug", debug_command))
 
-    # JobQueue is provided by python-telegram-bot[job-queue].
-    # It lets us run periodic checks inside the bot process.
     application.job_queue.run_repeating(
         scheduled_check,
         interval=CHECK_INTERVAL_SECONDS,
@@ -817,7 +1030,7 @@ def main() -> None:
         name="scheduled_vinted_check",
     )
 
-    logger.info("Bot started.")
+    logger.info("Bot started. Freshness filter: ONLY_RECENT_MINUTES=%s SKIP_UNKNOWN_AGE=%s", ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
