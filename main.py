@@ -289,21 +289,17 @@ def mark_item_sent(telegram_id: str, search_id: int, item_id: str, url: str) -> 
 
 def build_apify_input(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
     """
-    This default input is made for typical Vinted search actors on Apify.
-    Some Actors use slightly different input names.
-    If your selected Actor needs another schema, change only this function.
+    Input for piotrv1001/vinted-listings-scraper.
+    Price is filtered locally after Apify returns items.
     """
-    actor_input = {
-        "query": keyword,
-        "domain": DEFAULT_COUNTRY_DOMAIN,
+    return {
+        "searchQueries": [keyword],
         "maxItems": MAX_ITEMS_PER_SEARCH,
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"]
+        }
     }
-
-    # We filter max_price locally anyway, but some Actors may also accept this.
-    if max_price:
-        actor_input["maxPrice"] = max_price
-
-    return actor_input
 
 
 def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[str, Any]]:
