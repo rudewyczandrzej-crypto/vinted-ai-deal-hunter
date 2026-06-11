@@ -47,6 +47,12 @@ CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 MAX_ITEMS_PER_SEARCH = int(os.getenv("MAX_ITEMS_PER_SEARCH", "20"))
 MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "4"))
 
+# Dynamic AI filters. When you add a search in Telegram, Groq creates a JSON filter
+# and the bot stores it in Supabase searches.filter_json.
+DYNAMIC_AI_FILTERS_ENABLED = os.getenv("DYNAMIC_AI_FILTERS_ENABLED", "true").lower() in ["1", "true", "yes", "y"]
+FILTER_GENERATION_MODEL = os.getenv("FILTER_GENERATION_MODEL", GROQ_MODEL).strip()
+
+
 # New freshness filter.
 ONLY_RECENT_MINUTES = int(os.getenv("ONLY_RECENT_MINUTES", "5"))
 
@@ -75,13 +81,13 @@ BAD_KEYWORDS = [
         "porysowany ekran,rysy na ekranie,"
         "nie działa,nie dziala,niedziała,niedziala,"
         "części,czesci,na części,na czesci,"
-        "blokada apple id,blokada icloud,icloud lock,activation lock,"
-        "zablokowany apple id,zablokowana apple id,zablokowane apple id,"
-        "zablokowany icloud,zablokowana icloud,zablokowane icloud,"
-        "apple id locked,icloud locked,locked apple id,locked icloud,"
+        "blokada,icloud,apple id,appleid,"
+        "zablokowany,zablokowana,zablokowane,"
+        "zablokowany apple id,zablokowane apple id,blokada apple id,"
+        "blokada icloud,icloud lock,activation lock,"
         "brak hasła,brak hasla,nie znam hasła,nie znam hasla,"
-        "nie wylogowany z icloud,nie wylogowana z icloud,"
-        "nie wylogowany apple id,nie wylogowana apple id,"
+        "wylogowany nie jest,nie wylogowany,nie wylogowana,"
+        "locked,account locked,apple id locked,"
         "cracked,broken,damaged,for parts,not working"
     ).split(",")
     if x.strip()
@@ -467,77 +473,6 @@ def item_searchable_text(raw: Dict[str, Any]) -> str:
     return f"{title} | {description} | {condition} | {brand} | {flat}".lower()
 
 
-def has_bad_apple_lock_context(text: str) -> Tuple[bool, str]:
-    """
-    Smart iCloud / Apple ID check.
-    Allows good context like "wylogowany z iCloud" or "bez blokady iCloud",
-    rejects bad context like "blokada iCloud" or "activation lock".
-    """
-    t = (text or "").lower()
-
-    good_phrases = [
-        "icloud wylogowany",
-        "wylogowany z icloud",
-        "wylogowana z icloud",
-        "wylogowane z icloud",
-        "bez blokady icloud",
-        "bez blokady apple id",
-        "apple id usunięte",
-        "apple id usuniete",
-        "usunięte apple id",
-        "usuniete apple id",
-        "zresetowany",
-        "zresetowana",
-        "zresetowane",
-        "gotowy do sparowania",
-        "gotowa do sparowania",
-        "gotowe do sparowania",
-        "bez icloud lock",
-        "no icloud lock",
-        "icloud clean",
-        "apple id clean",
-    ]
-
-    bad_phrases = [
-        "blokada icloud",
-        "blokada apple id",
-        "zablokowany icloud",
-        "zablokowana icloud",
-        "zablokowane icloud",
-        "zablokowany apple id",
-        "zablokowana apple id",
-        "zablokowane apple id",
-        "icloud lock",
-        "activation lock",
-        "apple id locked",
-        "icloud locked",
-        "locked apple id",
-        "locked icloud",
-        "brak hasła",
-        "brak hasla",
-        "nie znam hasła",
-        "nie znam hasla",
-        "nie wylogowany z icloud",
-        "nie wylogowana z icloud",
-        "nie wylogowany apple id",
-        "nie wylogowana apple id",
-    ]
-
-    if any(p in t for p in good_phrases):
-        return False, "good apple lock context"
-
-    for phrase in bad_phrases:
-        if phrase in t:
-            return True, f"bad apple lock context: {phrase}"
-
-    if ("zablokowany" in t or "zablokowana" in t or "zablokowane" in t or "locked" in t) and (
-        "icloud" in t or "apple id" in t or "appleid" in t
-    ):
-        return True, "bad apple lock context: locked with apple/icloud"
-
-    return False, "no bad apple lock context"
-
-
 def passes_quality_filter(raw: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Reject obviously bad electronics before spending Groq tokens.
@@ -550,10 +485,6 @@ def passes_quality_filter(raw: Dict[str, Any]) -> Tuple[bool, str]:
     condition = str(get_first_existing(raw, ["condition", "status"], "")).strip().lower()
     if condition and any(bad == condition or bad in condition for bad in BAD_CONDITIONS):
         return False, f"bad condition: {condition}"
-
-    apple_lock_bad, apple_lock_reason = has_bad_apple_lock_context(text)
-    if apple_lock_bad:
-        return False, apple_lock_reason
 
     for keyword in BAD_KEYWORDS:
         if keyword and keyword in text:
@@ -586,11 +517,11 @@ def has_any(text: str, words: List[str]) -> bool:
 
 def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> Tuple[bool, str]:
     """
-    Product filter:
-    - uses title + description + brand + raw Vinted text
-    - iPad uses strict regex model matching
-    - Apple Watch search is specifically for SE 2, not SE 1
-    - Redmi Pad Pro stays strict: Redmi + Pad + Pro
+    Simpler product filter:
+    - uses title + description + brand + raw text from Vinted
+    - avoids overly strict filters for iPad/Redmi
+    - but Apple Watch search is specifically for SE 2, not SE 1
+    - lets Groq AI make the final judgement after basic matching
     """
     if not REJECT_ACCESSORIES:
         return True, "product filter disabled"
@@ -611,9 +542,6 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
                 return keyword
         return None
 
-    def regex_any(patterns: List[str], value: str) -> bool:
-        return any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in patterns)
-
     if profile == "ipad":
         if "ipad" not in combined:
             return False, "missing ipad keyword in title/description"
@@ -621,52 +549,24 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         if has_any(combined, ["iphone", "macbook", "airpods", "apple watch"]):
             return False, "wrong Apple product"
 
-        # First reject old iPads explicitly.
-        # Examples: iPad 7th gen, iPad 8gen, iPad 8 gen, iPad 8 generacji.
-        ipad_rejected_patterns = [
-            r"\bipad\s*(?:1|2|3|4|5|6|7|8)\s*(?:gen|generacji|\.?\s*generacji|th)?\b",
-            r"\bipad\s*(?:1st|2nd|3rd|4th|5th|6th|7th|8th)\s*(?:gen|generation)?\b",
-            r"\b(?:1st|2nd|3rd|4th|5th|6th|7th|8th)\s*gen\b",
-            r"\bipad\s*air\s*(?:1|2)?\b",
-            r"\bipad\s*mini\s*(?:1|2|3|4|5)?\b",
-        ]
-
-        if regex_any(ipad_rejected_patterns, combined):
-            return False, "old ipad generation rejected"
-
-        # Then allow only wanted iPads.
-        # Important: do NOT allow plain "10.2", because iPad 7/8 also has 10.2".
-        ipad_allowed_patterns = [
-            r"\bipad\s*9\s*(?:gen|generacji|\.?\s*generacji|th)\b",
-            r"\bipad\s*10\s*(?:gen|generacji|\.?\s*generacji|th)\b",
-            r"\bipad\s*(?:9th|10th)\s*(?:gen|generation)?\b",
-            r"\bipad\b.*\b(?:9th|10th)\s*gen\b",
-            r"\bipad\b.*\b(?:2021|2022|a16)\b",
-            r"\bipad\s*(?:2021|2022|a16)\b",
-            r"\bipad\b.*\b10[\.,]9\b",
-            r"\bipad\s*11\b",
-            r"\bipad\b.*\b2025\b",
-        ]
-
-        if not regex_any(ipad_allowed_patterns, combined):
-            return False, "ipad is not in allowed regex model list"
-
         accessory = title_has_accessory()
         if accessory:
             device_hints = [
                 "gb", "wifi", "wi-fi", "cellular", "tablet", "generacji",
-                "gen", "a16", "2021", "2022", "10.9", "10,9", "32gb", "64gb", "128gb", "256gb"
+                "gen", "a16", "2021", "2022", "10.9", "10,9"
             ]
             if not has_any(combined, device_hints):
                 return False, f"likely ipad accessory only: {accessory}"
 
-        return True, "ipad regex model filter ok"
+        return True, "ipad broad filter ok"
 
     if profile == "apple_watch_se":
         # We are looking specifically for Apple Watch SE 2.
+        # Sellers may write SE 2 only in description, so check combined text.
         if not ("apple" in combined and "watch" in combined):
             return False, "missing apple watch keywords in title/description"
 
+        # Reject obvious other lines.
         if has_any(combined, [
             "series 1", "series 2", "series 3", "series 4", "series 5",
             "series 6", "series 7", "series 8", "series 9", "series 10",
@@ -674,6 +574,8 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         ]):
             return False, "wrong apple watch series"
 
+        # SE 2 allowlist. This is intentionally stricter than before.
+        # Plain "Apple Watch SE 40mm" is probably SE 1, so reject it.
         se2_hints = [
             "se 2", "se2", "se 2gen", "se 2 gen", "se gen 2",
             "se 2 generacji", "se 2. generacji",
@@ -697,6 +599,7 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         return True, "apple watch se 2 filter ok"
 
     if profile == "redmi_pad_pro":
+        # Keep Redmi strict: must be Redmi + Pad + Pro.
         if not ("redmi" in combined and "pad" in combined):
             return False, "missing redmi pad keywords in title/description"
 
@@ -706,50 +609,13 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         if has_any(combined, ["redmi note", "xiaomi note", "telefon", "smartfon", "phone"]):
             return False, "wrong redmi product"
 
-        # We want Redmi Pad Pro 2 / newer, not first generation Redmi Pad Pro.
-        # Good hints can be in title or description.
-        redmi_pro2_hints = [
-            "redmi pad pro 2",
-            "pad pro 2",
-            "2 generacji",
-            "2. generacji",
-            "drugiej generacji",
-            "2 gen",
-            "2gen",
-            "2025",
-            "snapdragon 7s",
-            "7s gen 2",
-            "7s gen2",
-            "12.1",
-            "12,1",
-            "hyperos 2",
-            "mi pad pro 2"
-        ]
-
-        redmi_old_hints = [
-            "redmi pad pro 1",
-            "pad pro 1",
-            "1 generacji",
-            "1. generacji",
-            "pierwszej generacji",
-            "1 gen",
-            "1gen",
-            "2024"
-        ]
-
-        if has_any(combined, redmi_old_hints):
-            return False, "redmi pad pro first generation rejected"
-
-        if not has_any(combined, redmi_pro2_hints):
-            return False, "redmi pad pro is not clearly 2nd generation/newer"
-
         accessory = title_has_accessory()
         if accessory:
-            device_hints = ["tablet", "gb", "6/128", "8/256", "12.1", "12,1", "hyperos", "android", "2025", "2 gen"]
+            device_hints = ["tablet", "gb", "6/128", "8/256", "12.1", "12,1", "hyperos", "android"]
             if not has_any(combined, device_hints):
                 return False, f"likely redmi accessory only: {accessory}"
 
-        return True, "redmi pad pro 2/newer filter ok"
+        return True, "redmi pad pro broad filter ok"
 
     return True, "generic profile ok"
 
@@ -802,6 +668,174 @@ def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+# =========================
+# DYNAMIC AI FILTERS
+# =========================
+
+def as_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip().lower() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        return [x.strip().lower() for x in value.split(",") if x.strip()]
+    return []
+
+
+def get_filter_profile(search: Dict[str, Any]) -> Dict[str, Any]:
+    raw = search.get("filter_json") or search.get("ai_filter") or {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def text_contains_any(text: str, keywords: List[str]) -> Optional[str]:
+    text = (text or "").lower()
+    for kw in keywords:
+        kw = (kw or "").lower().strip()
+        if kw and kw in text:
+            return kw
+    return None
+
+
+def text_contains_all_groups(text: str, groups: Any) -> Tuple[bool, str]:
+    """
+    groups example: [["ipad", "i pad"], ["10 gen", "10 generacji", "10th", "2022"]]
+    At least one phrase from every group must exist.
+    """
+    text = (text or "").lower()
+    if not isinstance(groups, list):
+        return True, "no required groups"
+
+    for group in groups:
+        words = as_list(group)
+        if not words:
+            continue
+        if not any(w in text for w in words):
+            return False, "missing one required group: " + "/".join(words[:6])
+    return True, "required groups ok"
+
+
+def build_ai_filter_prompt(keyword: str, max_price: Optional[float]) -> str:
+    return f"""
+Ти створюєш JSON-фільтр для Telegram-бота, який шукає товари на Vinted у Польщі.
+Користувач НЕ буде сам писати фільтри. Він дає тільки людський запит.
+Твоя задача — самостійно згенерувати правила пошуку і відсіювання сміття.
+
+Запит користувача: {keyword}
+Максимальна ціна, якщо є: {max_price} PLN
+
+Поверни ТІЛЬКИ валідний JSON без markdown. Формат:
+{{
+  "vinted_query": "короткий пошуковий запит для Vinted польською/англійською, без ціни",
+  "filter_summary_ua": "коротко українською що саме шукаємо і що відсікаємо",
+  "required_groups": [
+    ["синоніми головного товару"],
+    ["синоніми конкретної моделі/покоління/версії"]
+  ],
+  "include_any": ["додаткові корисні слова, які можуть підтвердити що це правильний товар"],
+  "reject_any": ["слова, які треба відсікти: аксесуари, інші моделі, поломки, блокування"],
+  "wrong_product_any": ["слова інших товарів, які схожі але не підходять"],
+  "quality_risk_any": ["uszkodzony", "pęknięty", "zbity", "icloud", "blokada", "nie działa"],
+  "min_ai_score": 4,
+  "message_to_seller_pl": "коротке питання продавцю польською, що перевірити перед покупкою"
+}}
+
+Правила:
+- Для iPad 10 генерації додай варіанти: ipad 10, 10 gen, 10 generacji, 10th, 2022, 10.9, 10,9, A2696, A2757, A2777.
+- Для техніки завжди відсікай аксесуари: etui, case, szkło, folia, kabel, ładowarka, pudełko, rysik, klawiatura, pokrowiec, uchwyt.
+- Для Apple відсікай iCloud/Apple ID lock і зламані/на частини.
+- Якщо запит про конкретну модель, відсікай старі/інші моделі.
+- Не роби занадто вузький фільтр: продавці можуть писати назву неточно.
+- required_groups мають бути достатньо широкі, щоб не пропускати сміття, але не блокувати нормальні оголошення.
+""".strip()
+
+
+def fallback_filter(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    k = (keyword or "").lower()
+    required = [[keyword.lower()]] if keyword else []
+    if "ipad" in k and ("10" in k or "десят" in k or "gener" in k):
+        required = [["ipad", "i pad"], ["10", "10 gen", "10 generacji", "10th", "2022", "10.9", "10,9"]]
+    return {
+        "vinted_query": keyword,
+        "filter_summary_ua": "AI-фільтр fallback: шукаю основний запит, відсікаю аксесуари, поломки і блокування.",
+        "required_groups": required,
+        "include_any": [],
+        "reject_any": [
+            "etui", "case", "cover", "pokrowiec", "szkło", "szklo", "folia", "kabel",
+            "ładowarka", "ladowarka", "charger", "pudełko", "pudelko", "rysik", "stylus",
+            "klawiatura", "uchwyt", "stojak", "uszkodzony", "uszkodzona", "pęknięty",
+            "pekniety", "zbity", "nie działa", "nie dziala", "części", "czesci", "icloud",
+            "apple id", "blokada", "zablokowany", "locked", "broken", "damaged", "for parts"
+        ],
+        "wrong_product_any": [],
+        "quality_risk_any": ["uszkodzony", "pęknięty", "zbity", "icloud", "blokada", "nie działa"],
+        "min_ai_score": MIN_AI_SCORE_TO_SEND,
+        "message_to_seller_pl": "Dzień dobry, czy oferta jest aktualna? Czy urządzenie jest w pełni sprawne, bez blokady konta i czy można prosić o zdjęcia ekranu oraz numer modelu?"
+    }
+
+
+def generate_filter_with_ai(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    if not DYNAMIC_AI_FILTERS_ENABLED:
+        return fallback_filter(keyword, max_price)
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=FILTER_GENERATION_MODEL,
+            messages=[
+                {"role": "system", "content": "You generate strict but practical marketplace search filters. Return valid JSON only."},
+                {"role": "user", "content": build_ai_filter_prompt(keyword, max_price)},
+            ],
+            temperature=0.15,
+        )
+        content = completion.choices[0].message.content or "{}"
+        data = safe_json_loads(content)
+        if not isinstance(data, dict):
+            raise ValueError("AI did not return object")
+
+        data.setdefault("vinted_query", keyword)
+        data.setdefault("filter_summary_ua", "AI створив фільтр для цього пошуку.")
+        data.setdefault("required_groups", [])
+        data.setdefault("include_any", [])
+        data.setdefault("reject_any", [])
+        data.setdefault("wrong_product_any", [])
+        data.setdefault("quality_risk_any", [])
+        data.setdefault("min_ai_score", MIN_AI_SCORE_TO_SEND)
+        data.setdefault("message_to_seller_pl", "Dzień dobry, czy oferta jest aktualna i czy przedmiot jest w pełni sprawny?")
+        return data
+    except Exception as e:
+        logger.error("AI filter generation failed: %s", e)
+        return fallback_filter(keyword, max_price)
+
+
+def passes_dynamic_ai_filter(raw: Dict[str, Any], search: Dict[str, Any]) -> Tuple[bool, str]:
+    profile = get_filter_profile(search)
+    if not profile:
+        # Old searches without generated filter still work with old generic filtering.
+        return passes_product_profile_filter(raw, search.get("keyword", ""))
+
+    text = item_searchable_text(raw)
+    title = str(get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "")).lower()
+    combined = f"{title} | {text}".lower()
+
+    reject_words = as_list(profile.get("reject_any")) + as_list(profile.get("wrong_product_any")) + as_list(profile.get("quality_risk_any"))
+    bad = text_contains_any(combined, reject_words)
+    if bad:
+        return False, f"AI DB filter rejected keyword: {bad}"
+
+    ok, reason = text_contains_all_groups(combined, profile.get("required_groups"))
+    if not ok:
+        return False, f"AI DB filter: {reason}"
+
+    # include_any is optional; it boosts confidence but does not block by itself.
+    return True, "AI DB filter ok"
+
 # =========================
 # DATABASE
 # =========================
@@ -818,13 +852,34 @@ def ensure_user(telegram_id: str) -> None:
 
 
 def add_search(telegram_id: str, keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
-    result = supabase.table("searches").insert({
+    ai_filter = generate_filter_with_ai(keyword, max_price)
+    vinted_query = str(ai_filter.get("vinted_query") or keyword).strip() or keyword
+    min_ai_score = int(ai_filter.get("min_ai_score") or MIN_AI_SCORE_TO_SEND)
+
+    payload = {
         "telegram_id": telegram_id,
         "keyword": keyword,
+        "vinted_query": vinted_query,
         "max_price": max_price,
         "country": "pl",
         "active": True,
-    }).execute()
+        "filter_json": ai_filter,
+        "filter_summary": str(ai_filter.get("filter_summary_ua") or ""),
+        "min_ai_score": min_ai_score,
+    }
+
+    try:
+        result = supabase.table("searches").insert(payload).execute()
+    except Exception as e:
+        logger.error("Could not insert dynamic filter search. Did you run the new supabase.sql migration? %s", e)
+        # Fallback for old database schema. Search will still work, but filters will not be stored.
+        result = supabase.table("searches").insert({
+            "telegram_id": telegram_id,
+            "keyword": keyword,
+            "max_price": max_price,
+            "country": "pl",
+            "active": True,
+        }).execute()
 
     return result.data[0]
 
@@ -857,6 +912,22 @@ def deactivate_search(search_id: int, telegram_id: str) -> bool:
 
     supabase.table("searches").update({"active": False}).eq("id", search_id).eq("telegram_id", telegram_id).execute()
     return True
+
+
+def regenerate_search_filter(search_id: int, telegram_id: str) -> Optional[Dict[str, Any]]:
+    existing = get_search_by_id(search_id, telegram_id)
+    if not existing:
+        return None
+
+    ai_filter = generate_filter_with_ai(existing.get("keyword", ""), existing.get("max_price"))
+    payload = {
+        "filter_json": ai_filter,
+        "filter_summary": str(ai_filter.get("filter_summary_ua") or ""),
+        "vinted_query": str(ai_filter.get("vinted_query") or existing.get("keyword", "")),
+        "min_ai_score": int(ai_filter.get("min_ai_score") or MIN_AI_SCORE_TO_SEND),
+    }
+    supabase.table("searches").update(payload).eq("id", search_id).eq("telegram_id", telegram_id).execute()
+    return ai_filter
 
 
 def was_item_sent(telegram_id: str, item_id: str) -> bool:
@@ -1074,8 +1145,10 @@ def normalize_vinted_direct_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[str, Any]]:
-    raw_items = direct_vinted_request(keyword, max_price)
+def fetch_vinted_items(keyword: str, max_price: Optional[float], search: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    active_search = search or {"keyword": keyword, "max_price": max_price}
+    vinted_query = str(active_search.get("vinted_query") or keyword).strip() or keyword
+    raw_items = direct_vinted_request(vinted_query, max_price)
 
     filtered_recent = []
     skipped_old = 0
@@ -1103,10 +1176,10 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float]) -> List[Dict[st
             logger.info("Skipped item by quality: %s", quality_reason)
             continue
 
-        product_ok, product_reason = passes_product_profile_filter(raw_item, keyword)
+        product_ok, product_reason = passes_dynamic_ai_filter(raw_item, active_search)
         if not product_ok:
             skipped_product += 1
-            logger.info("Skipped item by product profile: %s", product_reason)
+            logger.info("Skipped item by AI DB product filter: %s", product_reason)
             continue
 
         filtered_recent.append(raw_item)
@@ -1304,7 +1377,7 @@ async def process_search(
     sent_count = 0
 
     try:
-        items = fetch_vinted_items(keyword, max_price)
+        items = fetch_vinted_items(keyword, max_price, search)
 
         if not items:
             if manual:
@@ -1328,10 +1401,11 @@ async def process_search(
 
             ai = evaluate_item_with_ai(item, search)
             score = int(ai.get("score", 0))
+            min_score = int(search.get("min_ai_score") or get_filter_profile(search).get("min_ai_score") or MIN_AI_SCORE_TO_SEND)
 
             mark_item_sent(telegram_id, search_id, str(item_id), item.get("url") or "")
 
-            if score < MIN_AI_SCORE_TO_SEND:
+            if score < min_score:
                 logger.info("Skipped low score item: %s score=%s", item.get("title"), score)
                 continue
 
@@ -1500,11 +1574,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 /list
 /delete ID
 /check
+/filter ID
+/refreshfilter ID
 /debug ipad
 /help
 
 <b>Приклад:</b>
-<code>/add apple watch se до 500</code>
+<code>/add ipad 10 генерації до 1200</code>
 """
 
     await update.message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
@@ -1526,7 +1602,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 4. Перевірити вручну:
 <code>/check</code>
 
-5. Тест Vinted direct:
+5. Подивитись AI-фільтр у базі:
+<code>/filter 3</code>
+
+6. Перегенерувати AI-фільтр:
+<code>/refreshfilter 3</code>
+
+7. Тест Vinted direct:
 <code>/debug ipad</code>
 
 <b>Фільтр свіжості:</b>
@@ -1559,16 +1641,23 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    await message.reply_text("🤖 Створюю AI-фільтр і записую його в базу...")
     created = add_search(telegram_id, keyword, max_price)
 
     price_text = f"до {max_price} PLN" if max_price else "без ліміту ціни"
+    profile = get_filter_profile(created)
+    summary = profile.get("filter_summary_ua") or created.get("filter_summary") or "AI-фільтр створено."
+    vinted_query = created.get("vinted_query") or profile.get("vinted_query") or keyword
 
     await message.reply_text(
         f"✅ Додав пошук #{created['id']}:\n"
-        f"🔎 {keyword}\n"
+        f"🔎 Твій запит: {keyword}\n"
+        f"🔍 Запит для Vinted: {vinted_query}\n"
         f"💰 {price_text}\n"
+        f"🧠 AI-фільтр: {summary}\n"
         f"🕒 Тільки останні {ONLY_RECENT_MINUTES} хв.\n\n"
-        f"Можеш вручну перевірити командою /check",
+        f"Подивитись правила: /filter {created['id']}\n"
+        f"Перевірити вручну: /check",
     )
 
 
@@ -1591,8 +1680,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     for s in searches:
         price = s.get("max_price")
         price_text = f"до {price} PLN" if price else "без ліміту"
+        vq = s.get("vinted_query") or get_filter_profile(s).get("vinted_query") or s.get("keyword")
         lines.append(
-            f"#{s['id']} — <b>{escape(s['keyword'])}</b> — {escape(price_text)}"
+            f"#{s['id']} — <b>{escape(s['keyword'])}</b> — {escape(price_text)}\n"
+            f"   🔍 Vinted: <code>{escape(vq)}</code>"
         )
 
     lines.append("\nВидалити: <code>/delete ID</code>")
@@ -1704,6 +1795,92 @@ product_reason: {escape(product_reason)}
         await message.reply_text(f"Debug error: {e}")
 
 
+
+async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message = update.message
+    if not chat or not message:
+        return
+
+    telegram_id = str(chat.id)
+    if not context.args or not context.args[0].isdigit():
+        await message.reply_text("Напиши так: /filter 3")
+        return
+
+    search = get_search_by_id(int(context.args[0]), telegram_id)
+    if not search:
+        await message.reply_text("Не знайшов такого пошуку.")
+        return
+
+    profile = get_filter_profile(search)
+    if not profile:
+        await message.reply_text("У цього пошуку ще немає AI-фільтра в базі. Можеш створити: /refreshfilter ID")
+        return
+
+    def short_list(name: str, value: Any, limit: int = 20) -> str:
+        items = []
+        if isinstance(value, list):
+            for x in value:
+                if isinstance(x, list):
+                    items.append(" / ".join([str(i) for i in x[:8]]))
+                else:
+                    items.append(str(x))
+        text = ", ".join(items[:limit])
+        return text or "—"
+
+    text = f"""
+🧠 <b>AI-фільтр пошуку #{escape(search.get('id'))}</b>
+
+🔎 <b>Твій запит:</b> {escape(search.get('keyword'))}
+🔍 <b>Vinted query:</b> <code>{escape(profile.get('vinted_query') or search.get('vinted_query') or search.get('keyword'))}</code>
+💰 <b>Max price:</b> {escape(search.get('max_price') or 'без ліміту')}
+
+<b>Опис:</b>
+{escape(profile.get('filter_summary_ua') or search.get('filter_summary') or '—')}
+
+<b>Обовʼязкові групи:</b>
+{escape(short_list('required', profile.get('required_groups')))}
+
+<b>Відсікаю:</b>
+{escape(short_list('reject', profile.get('reject_any')))}
+
+<b>Інші неправильні товари:</b>
+{escape(short_list('wrong', profile.get('wrong_product_any')))}
+
+<b>Ризики якості:</b>
+{escape(short_list('risk', profile.get('quality_risk_any')))}
+
+♻️ Перегенерувати: <code>/refreshfilter {escape(search.get('id'))}</code>
+"""
+    await message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
+
+
+async def refreshfilter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message = update.message
+    if not chat or not message:
+        return
+
+    telegram_id = str(chat.id)
+    if not context.args or not context.args[0].isdigit():
+        await message.reply_text("Напиши так: /refreshfilter 3")
+        return
+
+    search_id = int(context.args[0])
+    await message.reply_text("♻️ Перегенеровую AI-фільтр і записую в базу...")
+
+    profile = regenerate_search_filter(search_id, telegram_id)
+    if not profile:
+        await message.reply_text("Не знайшов такого пошуку.")
+        return
+
+    await message.reply_text(
+        f"✅ AI-фільтр оновлено для пошуку #{search_id}.\n"
+        f"🔍 Vinted query: {profile.get('vinted_query')}\n"
+        f"🧠 {profile.get('filter_summary_ua')}\n\n"
+        f"Подивитись правила: /filter {search_id}"
+    )
+
 # =========================
 # MAIN
 # =========================
@@ -1717,6 +1894,8 @@ def main() -> None:
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("check", check_command))
+    application.add_handler(CommandHandler("filter", filter_command))
+    application.add_handler(CommandHandler("refreshfilter", refreshfilter_command))
     application.add_handler(CommandHandler("debug", debug_command))
 
     application.job_queue.run_repeating(
