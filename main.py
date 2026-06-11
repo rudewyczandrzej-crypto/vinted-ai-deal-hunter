@@ -267,6 +267,27 @@ def parse_add_command(raw_text: str) -> Tuple[Optional[str], Optional[float]]:
     return keyword.strip(), max_price
 
 
+
+
+def normalize_search_keyword(value: Any) -> str:
+    """Normalize a search keyword so the bot can detect exact duplicates."""
+    text = str(value or "").lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def normalize_price(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def same_price(a: Any, b: Any) -> bool:
+    return normalize_price(a) == normalize_price(b)
+
 def get_first_existing(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
     for key in keys:
         if key in data and data[key] not in [None, ""]:
@@ -851,7 +872,45 @@ def ensure_user(telegram_id: str) -> None:
     }).execute()
 
 
+
+
+def find_duplicate_active_search(telegram_id: str, keyword: str, max_price: Optional[float]) -> Optional[Dict[str, Any]]:
+    """Return an existing active search if the same user already has the same keyword and price."""
+    try:
+        result = (
+            supabase.table("searches")
+            .select("*")
+            .eq("telegram_id", telegram_id)
+            .eq("active", True)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning("Could not check duplicate searches: %s", e)
+        return None
+
+    target_keyword = normalize_search_keyword(keyword)
+    for row in result.data or []:
+        if normalize_search_keyword(row.get("keyword")) == target_keyword and same_price(row.get("max_price"), max_price):
+            return row
+    return None
+
+
+def clear_active_searches(telegram_id: str) -> int:
+    """Deactivate all active searches for one Telegram chat. Sent-item history is kept."""
+    active = get_active_searches(telegram_id)
+    if not active:
+        return 0
+
+    supabase.table("searches").update({"active": False}).eq("telegram_id", telegram_id).eq("active", True).execute()
+    return len(active)
+
 def add_search(telegram_id: str, keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    duplicate = find_duplicate_active_search(telegram_id, keyword, max_price)
+    if duplicate:
+        duplicate = dict(duplicate)
+        duplicate["_already_exists"] = True
+        return duplicate
+
     ai_filter = generate_filter_with_ai(keyword, max_price)
     vinted_query = str(ai_filter.get("vinted_query") or keyword).strip() or keyword
     min_ai_score = int(ai_filter.get("min_ai_score") or MIN_AI_SCORE_TO_SEND)
@@ -1573,6 +1632,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 /add iphone 13 | 1000
 /list
 /delete ID
+/clear
 /check
 /filter ID
 /refreshfilter ID
@@ -1596,19 +1656,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 2. Подивитися активні пошуки:
 <code>/list</code>
 
-3. Видалити пошук:
+3. Видалити один пошук:
 <code>/delete 3</code>
 
-4. Перевірити вручну:
+4. Очистити всі активні пошуки:
+<code>/clear</code>
+
+5. Перевірити вручну:
 <code>/check</code>
 
-5. Подивитись AI-фільтр у базі:
+6. Подивитись AI-фільтр у базі:
 <code>/filter 3</code>
 
-6. Перегенерувати AI-фільтр:
+7. Перегенерувати AI-фільтр:
 <code>/refreshfilter 3</code>
 
-7. Тест Vinted direct:
+8. Тест Vinted direct:
 <code>/debug ipad</code>
 
 <b>Фільтр свіжості:</b>
@@ -1641,13 +1704,23 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    await message.reply_text("🤖 Створюю AI-фільтр і записую його в базу...")
+    await message.reply_text("🤖 Перевіряю дублікати і створюю AI-фільтр, якщо такого пошуку ще немає...")
     created = add_search(telegram_id, keyword, max_price)
 
     price_text = f"до {max_price} PLN" if max_price else "без ліміту ціни"
     profile = get_filter_profile(created)
     summary = profile.get("filter_summary_ua") or created.get("filter_summary") or "AI-фільтр створено."
     vinted_query = created.get("vinted_query") or profile.get("vinted_query") or keyword
+
+    if created.get("_already_exists"):
+        await message.reply_text(
+            f"ℹ️ Такий активний пошук уже є: #{created['id']}\n"
+            f"🔎 Твій запит: {created.get('keyword') or keyword}\n"
+            f"🔍 Запит для Vinted: {vinted_query}\n"
+            f"💰 {price_text}\n\n"
+            f"Я не створював дубль. Подивитись правила: /filter {created['id']}",
+        )
+        return
 
     await message.reply_text(
         f"✅ Додав пошук #{created['id']}:\n"
@@ -1686,7 +1759,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"   🔍 Vinted: <code>{escape(vq)}</code>"
         )
 
-    lines.append("\nВидалити: <code>/delete ID</code>")
+    lines.append("\nВидалити один: <code>/delete ID</code>\nОчистити всі: <code>/clear</code>")
 
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -1714,6 +1787,28 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await message.reply_text(f"🗑 Видалив пошук #{search_id}")
 
+
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message = update.message
+
+    if not chat or not message:
+        return
+
+    telegram_id = str(chat.id)
+    ensure_user(telegram_id)
+
+    count = clear_active_searches(telegram_id)
+    if count == 0:
+        await message.reply_text("У тебе не було активних пошуків для очищення.")
+        return
+
+    await message.reply_text(
+        f"🧹 Очистив активні пошуки: {count}.\n"
+        "Історію вже надісланих оферт не чіпав, щоб не спамити старими оголошеннями."
+    )
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
@@ -1893,6 +1988,7 @@ def main() -> None:
     application.add_handler(CommandHandler("add", add_command))
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("delete", delete_command))
+    application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("filter", filter_command))
     application.add_handler(CommandHandler("refreshfilter", refreshfilter_command))
